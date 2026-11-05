@@ -1,0 +1,108 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#include <test_utils.hpp>
+
+#include <cuco/detail/__config>
+#include <cuco/static_set.cuh>
+
+#include <cuda/iterator>
+#include <cuda/std/functional>
+#include <thrust/device_vector.h>
+#include <thrust/sequence.h>
+#include <thrust/sort.h>
+#include <thrust/transform.h>
+
+#include <catch2/catch_template_test_macros.hpp>
+
+#include <cstdint>
+
+static constexpr int key_sentinel = -1;
+
+template <typename Set>
+void test_unique_sequence(Set& set, std::size_t num_keys)
+{
+  using Key = typename Set::key_type;
+
+  thrust::device_vector<Key> keys(num_keys);
+  thrust::device_vector<Key> matched_keys(num_keys);
+
+  auto iter = cuda::counting_iterator<Key>{0};
+
+  SECTION("Non-inserted keys should not be contained.")
+  {
+    REQUIRE(set.size() == 0);
+
+    REQUIRE(set.count(iter, iter + num_keys) == 0);
+
+    auto const [probe_end, matched_end] =
+      set.retrieve(iter, iter + num_keys, keys.begin(), matched_keys.begin());
+    REQUIRE(std::distance(keys.begin(), probe_end) == 0);
+    REQUIRE(std::distance(matched_keys.begin(), matched_end) == 0);
+  }
+
+  set.insert(iter, iter + num_keys);
+
+  SECTION("All inserted key/value pairs should be contained.")
+  {
+    REQUIRE(set.count(iter, iter + num_keys) == num_keys);
+
+    auto const [probe_end, matched_end] =
+      set.retrieve(iter, iter + num_keys, keys.begin(), matched_keys.begin());
+    thrust::sort(keys.begin(), probe_end);
+    thrust::sort(matched_keys.begin(), matched_end);
+    REQUIRE(cuco::test::equal(
+      keys.begin(), keys.end(), cuda::counting_iterator<Key>(0), cuda::std::equal_to<Key>{}));
+    REQUIRE(cuco::test::equal(matched_keys.begin(),
+                              matched_keys.end(),
+                              cuda::counting_iterator<Key>(0),
+                              cuda::std::equal_to<Key>{}));
+  }
+}
+
+TEMPLATE_TEST_CASE_SIG(
+  "static_set retrieve tests",
+  "",
+  ((typename Key, cuco::test::probe_sequence Probe, int CGSize), Key, Probe, CGSize),
+  (int8_t, cuco::test::probe_sequence::double_hashing, 1),
+  (int8_t, cuco::test::probe_sequence::linear_probing, 1),
+  (int8_t, cuco::test::probe_sequence::linear_probing, 2),
+  (int16_t, cuco::test::probe_sequence::double_hashing, 1),
+  (int16_t, cuco::test::probe_sequence::double_hashing, 2),
+  (int16_t, cuco::test::probe_sequence::linear_probing, 1),
+  (int16_t, cuco::test::probe_sequence::linear_probing, 2),
+  (int32_t, cuco::test::probe_sequence::double_hashing, 1),
+  (int32_t, cuco::test::probe_sequence::double_hashing, 2),
+  (int64_t, cuco::test::probe_sequence::double_hashing, 1),
+  (int64_t, cuco::test::probe_sequence::double_hashing, 2),
+  (int32_t, cuco::test::probe_sequence::linear_probing, 1),
+  (int32_t, cuco::test::probe_sequence::linear_probing, 2),
+  (int64_t, cuco::test::probe_sequence::linear_probing, 1),
+  (int64_t, cuco::test::probe_sequence::linear_probing, 2)
+#if defined(CUCO_HAS_128BIT_ATOMICS)
+    ,
+  (__int128_t, cuco::test::probe_sequence::double_hashing, 1),
+  (__int128_t, cuco::test::probe_sequence::double_hashing, 2),
+  (__int128_t, cuco::test::probe_sequence::linear_probing, 1),
+  (__int128_t, cuco::test::probe_sequence::linear_probing, 2)
+#endif
+)
+{
+  // Limit key count for small types: leave room for the -1 sentinel
+  constexpr std::size_t num_keys       = (sizeof(Key) == 1) ? 100 : 400;
+  constexpr double desired_load_factor = 1.;
+
+  using probe = std::conditional_t<Probe == cuco::test::probe_sequence::linear_probing,
+                                   cuco::linear_probing<CGSize, cuco::default_hash_function<Key>>,
+                                   cuco::double_hashing<CGSize, cuco::default_hash_function<Key>>>;
+
+  auto set = cuco::static_set{num_keys,
+                              desired_load_factor,
+                              cuco::empty_key<Key>{static_cast<Key>(key_sentinel)},
+                              {},
+                              probe{}};
+
+  test_unique_sequence(set, num_keys);
+}

@@ -1,12 +1,15 @@
 # SparsityAwareGICP Algorithm Flow
 
-本文档描述当前 `SparsityAwareGICP` 的 CPU 实现、数据流和数值约定。稀疏化、协方差估计、对应搜索、法方程构建和位姿更新都在 CPU 上完成；实现不依赖 CUDA、`cuco`、CUB 或设备端数据结构。
+当前 `GICP` 的预处理、逐点去畸变、地图插入、协方差、对应搜索、法方程归约、LDLT 求解、SE(3) 更新与收敛判定均在 GPU。CPU 只保留 ROS 输入输出、首帧强度统计、IMU 轨迹传播和 ESKF 融合。构建、同步边界及实测结果见 [README](../README.md)。
+
+第 1、3、4、13–15 节保留旧 `SparsityAwareGICP` 的布局和实验历史，不代表当前设备端布局、配置或可执行目标。历史 Cauchy/阻尼推导属于可选拓展；当前实现取 $w=1$、$\lambda=0$。
 
 实现位于以下文件：
 
-- `include/perception/GICP/preprocess.hpp`：点云稀疏化、体素 key 与体素布局。
-- `include/perception/GICP/SparsityAwareGICP.h`：公开配置、结果和目标缓存定义。
-- `source/GICP/SparsityAwareGICP.cpp`：协方差估计、对应搜索、GICP 求解和目标地图操作。
+- [`GICP.h`](../include/localization/GICP/GICP.h)：配置、结果与常驻帧接口。
+- [`GICP.cu`](../source/GICP/GICP.cu)：预处理、去畸变、完整设备端配准和可视化地图。
+- [`SparseVoxelDevice.cuh`](../include/localization/types/SparseVoxelDevice.cuh)：设备视图、异步缓冲和近邻搜索。
+- [`SparseVoxel.cu`](../source/types/SparseVoxel.cu)：异步插入、增量协方差和显式主机兼容接口。
 
 ## 1 数据对象
 
@@ -93,19 +96,18 @@ struct TargetCache
 
 ```mermaid
 flowchart TD
-    A[输入 PCL 点云] --> B[CPU 稀疏化]
-    B --> C[构建按体素排序的布局]
-    C --> D[CPU 协方差估计]
-    D --> E{目标地图操作}
-    E -->|initializeTarget| F[创建 TargetCache]
-    E -->|align source| G[迭代配准]
-    G --> H[CPU 对应搜索]
-    H --> I[构建 Hessian 和 gradient]
-    I --> J[Eigen LDLT 求解]
-    J --> K[Sophus 左乘更新]
-    K --> L{增量足够小?}
-    L -->|否| H
-    L -->|是| M[输出 Result]
+    A[CPU ROS 解码] --> B[一次上传原始点云]
+    B --> C[GPU 去畸变/强度与足迹过滤/体素质心]
+    C --> D[GPU 稀疏插入与协方差]
+    D --> E[GPU 变换/对应搜索/残差与 Jacobian]
+    E --> F[GPU CUB 分块归约]
+    F --> G[GPU 双精度 LDLT 与 SE3 左乘]
+    G --> H{GPU 收敛或失败?}
+    H -->|否| E
+    H -->|是| I[GPU 验收/地图更新]
+    I --> J[下载紧凑结果]
+    I --> K[有订阅时下载可视化点云]
+    J --> L[CPU 位姿发布或 ESKF 融合]
 ```
 
 
@@ -179,10 +181,14 @@ add new voxel keys to voxel_map and occupied_voxels
 
 ## 5 协方差估计：`estimateCovariances()`
 
-当前 `GICP` 使用 `SparseVoxel::estimateCovariances()` 在 CPU 上并行估计协方差。
+当前 `GICP` 使用 [`SparseVoxel.cu`](../source/types/SparseVoxel.cu) 中的 CUDA 内核并行估计协方差。
 初次插入和增量插入都使用同一策略；增量插入会重新估计受影响体素及相邻体素中的点。
-并行任务以体素为单位：每个受影响体素只查找一次相邻体素，随后让其中各点共享候选体素列表。
-列表只在本次更新中使用，避免增量插入后持久缓存失效；各点仍独立选取最近邻和估计协方差。
+GPU 按 key 稳定分组，每个体素由一个线程按原输入顺序筛点，不使用竞争式自旋锁。
+设备哈希表保存体素下标而不是设备指针，扩容重建哈希表不会留下悬空指针。
+受影响标记去重后，每个有效点由一个线程独立选取最近邻并更新协方差。
+GPU 上的计数、前缀和与点下标列表直接供后续内核使用，不为插入结果回传体素或点数组。
+主机镜像仅在显式主机查询时创建；一旦对外暴露点指针，独立 `SparseVoxel::insert()` 会刷新该兼容镜像。
+配准私有地图不暴露主机指针，因此不触发该同步路径。
 
 ### 5.1 邻域搜索
 
@@ -199,7 +205,7 @@ $$
 堆填满后，使用当前最远邻居距离作为搜索半径；若查询点到某候选体素包围盒的距离下界
 已经超过该半径，则跳过整个体素的点扫描。浮点比较留有保守裕量，避免边界误剪枝。
 
-### 5.2 PCL 式协方差谱归一化
+### 5.2 保留现有 Frobenius 协方差归一化
 
 对于 $N$ 个候选邻居，先计算均值：
 
@@ -213,31 +219,28 @@ $$
 \Sigma_{\mathrm{raw}} = \frac{1}{N - 1}\sum_i(p_i - \mu)(p_i - \mu)^T
 $$
 
-对其做 SVD，按奇异值从大到小保留主轴方向 $U$，将方差重设为 PCL GICP 默认的
-`(1, 1, 0.001)`：
+沿用迁移前代码的对角正则和逆矩阵 Frobenius 范数缩放：
 
 $$
-\Sigma_{\mathrm{GICP}} =
-U\,\mathrm{diag}(1,1,10^{-3})\,U^T
+C = \Sigma_{\mathrm{raw}} + 10^{-6}I,\qquad
+\Sigma_{\mathrm{GICP}} = C\,\|C^{-1}\|_F
 $$
 
-这表示切向弱约束、法向强约束，不是简单添加对角线正则，也不按逆矩阵范数缩放。
-有效结果设 `covariance_valid = true`。原始平面协方差即使奇异，重构结果仍正定。
-SVD 失败会输出 PCL 错误日志，并保留该点无效单位阵的现有回退，不会将其标记为有效。
+有效结果设 `covariance_valid = true`；邻居不足时保留无效单位阵。
+非有限或不可用的归一化结果会通过异常显式报告，不会伪装成有效协方差。
 
 此矩阵是 GICP 的几何权重模型，不应作为物理测量噪声协方差。
-源点和目标点都使用相同归一化；体素稀疏化、邻域范围、最少邻居数及位姿优化器保持不变。
-当前使用最少 8、最多 12 个邻居及 0.5 m 体素，存储和 SVD 使用 `float`；
-PCL 的协方差计算使用 `double`，因此并非逐位一致。
-FAR-LIO 公式已单独实验并恢复为本策略，见第 15 节。
+源点和目标点都使用相同归一化；当前使用最少 8、最多 12 个邻居及 0.5 m 体素，存储和运算使用 `float`。
+这不是 PCL 的固定谱模型；第 15 节为此前实验记录。CUDA 迁移不切换协方差策略，
+回归测试直接对照迁移前代码的 CPU 公式。
 
 
 
 ## 6 对应搜索：`SparseVoxel::nearestNeighbor()`
 
-每次迭代对每个源点执行：
+配准内核直接读取常驻源点、目标地图和设备端位姿，不调用会回传结果的主机 `nearestNeighborBatch()`。每个源点在 GPU 执行：
 
-1. 用当前 `Sophus::SE3d source_to_target` 将源点变换到目标坐标系；
+1. 用当前设备端双精度 $(R,t)$ 将源点变换到目标坐标系；
 2. 找到该位置所在体素；
 3. 先搜索当前体素，尽早收紧最近距离；
 4. 枚举其余相邻一层体素，用包围盒距离下界剪枝后再查询哈希表；
@@ -265,9 +268,10 @@ $$
 
 
 
-## 7 GICP 线性系统：`buildAndSolve()`
+## 7 GICP 线性系统：设备端构建与归约
 
-每一轮对应搜索后，CPU 遍历所有有效对应，构建一个稠密的 $6 \times 6$ Hessian 和 $6 \times 1$ gradient。
+每个 GPU 线程计算有效对应的残差、Jacobian 和加权贡献。Hessian 只保存 21 个上三角元素，
+与 6 个梯度元素、残差平方和及整数计数一起经 CUB 分块归约。第二个内核完成最终归约和求解，不回传法方程。
 
 ### 7.1 残差与协方差
 
@@ -358,7 +362,7 @@ $$
 g_i = J^T w W r
 $$
 
-并在 CPU 中直接累加：
+并在 GPU 中以双精度归约（当前 $w=1$）：
 
 $$
 H = \sum_i H_i, \qquad g = \sum_i g_i
@@ -370,27 +374,21 @@ $$
 
 ## 8 求解、更新与收敛
 
-若没有有效约束，或未加权欧氏残差平方和非有限，当前轮失败并停止迭代。否则先计算：
+若没有有效约束，或未加权欧氏残差平方和非有限，设备端停止本轮数值工作。当前不增加阻尼，求解：
 
 $$
-H' = H + \lambda I
+H\delta=-g
 $$
 
-其中 $\lambda = \text{damping\_factor}$。这是固定的对角线阻尼，不是自适应 Levenberg-Marquardt 阻尼。
-
-`Eigen::LDLT<Eigen::Matrix<float, 6, 6>>` 求解：
-
-$$
-H'\delta = -g
-$$
-
-若分解或求解失败，或 `left_increment.allFinite()` 为假，迭代停止。成功后由 Sophus 完成指数映射和左乘更新：
+GPU 使用固定大小、带对角主元交换的双精度 LDLT；零主元方向沿用 Eigen LDLT 的处理方式。
+分解或求解失败则停止迭代；非有限位姿更新显式报错。成功后在设备端计算指数映射和左乘更新：
 
 ```cpp
-source_to_target = Sophus::SE3f::exp(left_increment) * source_to_target;
+T_next = exp(delta) * T;
 ```
 
-因此不再维护手写 Rodrigues 或 $SE(3)$ 左雅可比实现。
+旋转采用 Rodrigues 公式，平移采用 SO(3) 左 Jacobian；小角度使用 Taylor 展开。
+主机只提交固定预算的内核批次；设备标志使收敛后的批次不再执行数值工作，无逐轮主机轮询。
 
 若同时满足：
 
@@ -414,30 +412,16 @@ $$
 if source cloud empty:
     throw std::invalid_argument
 
-if target not initialized:
-    throw std::runtime_error
+upload source once
+enqueue GPU source insertion/covariances
+initialize device pose and counts
+enqueue at most max_iterations pairs of linearization and solve kernels
+    device flags skip work after failure/convergence
+enqueue GPU convergence fallback and acceptance
+download compact result and synchronize once
 
-result.transform = initial_guess
-source_layout = preprocess(source)
-record sparse source and target point counts
-
-if source_layout or target map has no points:
-    return result
-
-source_points = estimateCovariances(source_layout)
-source_to_target = Sophus::SE3f(initial_guess rotation, initial_guess translation)
-
-repeat at most max_iterations times:
-    findCorrespondences(...)
-    buildAndSolve(...)
-    if solve failed:
-        stop
-    write updated transform to result
-    if increment is below both convergence thresholds:
-        mark converged and stop
-
-if at least one successful iteration completed and fitness is finite:
-    mark converged
+empty target or zero iterations:
+    preserve initial_guess, converged=false
 ```
 
 最后的宽松回退意味着 `converged` 不严格等价于“增量已低于阈值”：只要至少完成一次成功更新且 `fitness_score` 有限，结果也会标记为已收敛。
@@ -453,37 +437,38 @@ $$
 
 ## 10 输出结果与调用方验收
 
-`SparsityAwareGICP::Result` 包含：
+`GICP::Result` 包含：
 
 - `converged`：是否满足严格阈值，或触发成功迭代后的宽松回退；
 - `iterations`：成功完成位姿更新的次数；
 - `num_source_points`：稀疏化后的源点数；
 - `num_target_points`：当前缓存的目标点数；
+- `num_invalid_points`：预处理丢弃的非有限输入点数；
 - `num_correspondences`：最近一次构建法方程时的有效约束数；
 - `fitness_score`：最近一次构建法方程时的平均欧氏残差平方；
 - `transform`：从源点坐标系到目标地图坐标系的估计变换。
 
-`Localization::alignICP()` 将 `mBasePose` 作为初始值传入，只有在以下条件都通过后才接受 `result.transform`：
+LO 节点使用 `processFrame()`。位姿在收敛且对应数足够时更新；地图更新额外要求 fitness 达标，保留原有调用方顺序：
 
 ```text
 result.converged
 result.num_correspondences >= config.min_correspondences
-result.fitness_score <= config.max_fitness_score
+map update additionally requires:
+    result.fitness_score <= config.max_fitness_score
 ```
 
 
 
-## 11 CPU 性能特征
+## 11 GPU 常驻与同步边界
 
-当前计算都在调用线程的 CPU 上执行，没有 GPU 上传、kernel launch 或异步设备任务。主要耗时来自：
+排序、前缀和和压缩计数均使用设备端 CUB；缓冲与哈希表采用流有序分配并复用容量。
+常态 LO 帧在没有可视化订阅时只有一次原始点云上传、一次紧凑结果下载和一次结果边界同步。
+存在订阅时，扫描和地图下载合并到该边界；不维护每帧 CPU 点云地图。
 
-1. 源点和初始目标的稀疏化、排序与体素布局构建；
-2. 协方差估计中每点对 $(2r + 1)^3$ 个邻近体素的扫描；
-3. 每轮对应搜索中每点对固定 27 个目标体素的扫描；
-4. 每个有效对应的 $3 \times 6$ Jacobian、$6 \times 6$ Hessian 累加；
-5. 至多 `max_iterations` 次 CPU 迭代。
-
-`LDLT` 求解的是固定大小的 $6 \times 6$ 系统，通常不是主要瓶颈。性能主要受保留点数量、每体素点数、协方差搜索半径、实际邻居数以及迭代次数影响。
+LIO 的 IMU 轨迹积分及 ESKF 融合留在 CPU，逐点插值、去畸变和过滤在 GPU。
+融合后的位姿通过小参数传回设备，地图更新复用已上传的扫描并异步排队。
+融合后如需发布点云，`downloadPrepared()` 是额外的显式输出边界。
+地图扩容、显式主机查询、对象复制和销毁仍可能同步；不宣称整套系统完全没有同步。
 
 
 
@@ -491,19 +476,17 @@ result.fitness_score <= config.max_fitness_score
 
 - `voxel_size` 同时影响稀疏化、协方差邻域和对应搜索的物理尺度，当前三个尺度尚未解耦。
 - 对应搜索只查询一层相邻体素；单独增大 `max_correspondence_distance` 可能仍会漏掉更远体素中的候选。
-- `insertTargetPoints()` 不补充已有体素，并且新点协方差不参考旧地图邻居。
-- 目标地图只有 `max_target_voxels` 容量上限，没有空间裁剪或淘汰策略。
+- 已有体素可继续补点，直到容量或最小间距门限；旧点协方差随邻近插入更新。
+- 地图按需扩容，未增加空间裁剪、淘汰或自适应密度策略；设备内存不足会显式报错。
 - 有效协方差的回退规则目前以源点协方差有效性为分支；若希望任一有效协方差均参与约束，需要调整该逻辑。
 - 大面积平面或平行结构仍可能导致某些自由度约束不足；更可靠的初始位姿或运动先验能降低局部最优和错误对应风险。
 
-轮速或其他里程计最直接的融合方式是提供更好的 `initial_guess`。若需将先验直接加入优化，则应在 CPU 端构建完 $H$、$g$ 后加入相应的先验项，再复用同一个 $6 \times 6$ `LDLT` 求解流程。
+轮速或其他里程计最直接的融合方式是提供更好的 `initial_guess`。若需将先验直接加入优化，应在 GPU 归约结果上加入相应先验项，再复用同一个设备端 $6 \times 6$ LDLT 流程。
 
-## 13 当前 GICP 与 PCL 的可复现对比
+## 13 历史 GICP 与 PCL 对比
 
-[`tests/gicp_benchmark.cpp`](../tests/gicp_benchmark.cpp) 直接编译当前
-[`GICP`](../include/localization/GICP/GICP.h)、
-[`SparseVoxel`](../include/localization/types/SparseVoxel.h) 和安装的 PCL GICP，
-不修改任何配准算法。启用 `BUILD_TESTING` 后，在工作区根目录运行：
+以下为已移除旧测试目标的历史实验命令，不是当前 CUDA 验证入口。
+当前回归与 Nsight 复现步骤见 [README](../README.md)。
 
 ```bash
 source /opt/ros/jazzy/setup.bash

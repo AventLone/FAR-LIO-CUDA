@@ -1,5 +1,11 @@
 # IMU–LiDAR 紧耦合 ESKF
 
+当前 ROS LIO 路径将 IMU 轨迹传播与 ESKF 融合保留在 CPU；
+逐点轨迹插值、去畸变、过滤、GICP 和地图更新使用 GPU 常驻数据。
+`ImuProcessor::prepareTrajectory()` 只生成轨迹，节点不再调用其 CPU 逐点去畸变。
+融合后的位姿用于异步 `insertPreparedTarget()`；只有可视化订阅时才下载点云。
+详见 [README](../README.md)。以下旧 IESKF 点云观测接口与测试命令保留作历史说明。
+
 ## IESKF 优化实现
 
 本节对应 `source/LIO/IESKF.cpp`；下文的可配置 `ESKF` 是另一套接口，参数与积分实现不要混用。

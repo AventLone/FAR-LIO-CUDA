@@ -1,7 +1,8 @@
 #pragma once
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
-#include "localization/types/SparseVoxel.h"
+#include "localization/types/SparseVoxel.cuh"
+#include "localization/types/deskew.hpp"
 #include <sophus/se3.hpp>
 
 class GICP
@@ -27,26 +28,42 @@ public:
         int iterations{0};
         std::size_t num_source_points{0};
         std::size_t num_target_points{0};
+        std::size_t num_invalid_points{0};
         std::size_t num_correspondences{0};
         double fitness_score{std::numeric_limits<double>::infinity()};
         Eigen::Isometry3d transform{Eigen::Isometry3d::Identity()};
     };
 
-    GICP() : GICP(Config{})
+    struct PreprocessConfig
     {
-    }
+        float voxel_size{0.1f};
+        float intensity_threshold{-1.0f};
+        float footprint_x{0.0f};
+        float footprint_y{0.0f};
+        float map_voxel_size{0.2f};
+        Eigen::Isometry3f sensor_to_output{Eigen::Isometry3f::Identity()};
+    };
 
-    explicit GICP(const Config& config) : mConfig(config)
+    struct FrameResult
     {
-    }
+        Result registration;
+        std::size_t num_processed_points{0};
+        std::size_t num_invalid_points{0};
+        bool initialized{false};
+        bool map_updated{false};
+        pcl::PointCloud<pcl::PointXYZ> scan_in_map;
+        pcl::PointCloud<pcl::PointXYZ> map;
+    };
 
-    GICP(GICP&&) noexcept = default;
-    GICP& operator=(GICP&&) noexcept = default;
+    GICP();
+    explicit GICP(const Config& config);
+    GICP(GICP&&) noexcept;
+    GICP& operator=(GICP&&) noexcept;
 
     GICP(const GICP&) = delete;
     GICP& operator=(const GICP&) = delete;
 
-    ~GICP() = default;
+    ~GICP();
 
     [[nodiscard]] const Config& config() const noexcept
     {
@@ -62,15 +79,25 @@ public:
 
     Result align(const pcl::PointCloud<pcl::PointXYZ>& source, const Eigen::Isometry3d& initial_guess) const;
 
+    // Preparation and map insertion enqueue work on the same stream without downloading point data.
+    void prepareSource(const pcl::PointCloud<pcl::PointXYZI>& source, const PreprocessConfig& config);
+    void prepareSource(const StampedCloud& source, const PreprocessConfig& config,
+                       std::span<const TimedPose> trajectory = {},
+                       const Eigen::Isometry3d& lidar_to_imu = Eigen::Isometry3d::Identity());
+    Result alignPrepared(const Eigen::Isometry3d& initial_guess) const;
+    bool initializePreparedTarget(const Eigen::Isometry3d& pose, std::size_t minimum_points);
+    void insertPreparedTarget(const Eigen::Isometry3d& pose);
+    std::size_t preparedPointCount() const noexcept;
+
+    FrameResult downloadPrepared(const Eigen::Isometry3d& pose, bool download_scan, bool download_map);
+    FrameResult processFrame(const pcl::PointCloud<pcl::PointXYZI>& source, const Eigen::Isometry3d& initial_guess,
+                             const PreprocessConfig& config, bool download_scan = false, bool download_map = false,
+                             std::size_t minimum_initial_points = 101);
+
 private:
+    struct Impl;
     Config mConfig;
-    SparseVoxel mTarget;
+    mutable std::unique_ptr<Impl> mImpl;
 
-    // void findCorrespondences(const std::vector<const PointWithCovariance*>& source, const SparseVoxel& target,
-    //                          const Sophus::SE3d& source_to_target, std::vector<Correspondence>& correspondences) const;
-
-
-    std::optional<std::pair<std::size_t, double>> findCorrespondencesAndSolve(const std::vector<const PointWithCovariance*>& source,
-                                                                              Sophus::SE3d& source_to_target,
-                                                                              Sophus::SE3d::Tangent& left_increment) const;
+    Impl& deviceState() const;
 };

@@ -1,0 +1,60 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#pragma once
+
+#include <nv/target>
+#include <cuda/std/__cccl/ptx_isa.h>
+#include <cuda/std/version>
+
+#if !defined(__CUDACC_VER_MAJOR__) || !defined(__CUDACC_VER_MINOR__)
+#error "NVCC version not found"
+#elif __CUDACC_VER_MAJOR__ < 12
+#error "NVCC version 12.0 or later is required"
+#endif
+
+#if !defined(__CUDACC_EXTENDED_LAMBDA__)
+#error "Support for extended device lambdas is required (nvcc flag --expt-extended-lambda)"
+#endif
+
+#if !defined(CCCL_VERSION) || (CCCL_VERSION < 3002000)
+#error "CCCL version 3.2.0 or later is required"
+#endif
+
+// WAR for cuCollections/804: work around the nvcc __cuda_is_local / isspacep.local
+// miscompile on CUDA < 13.1. CCCL's auto-define of this macro only fires when
+// NDEBUG is not set, but cuco builds Release, so define it unconditionally for
+// affected toolkit versions.
+#if !defined(_CCCL_ATOMIC_UNSAFE_AUTOMATIC_STORAGE) \
+  && ((__CUDACC_VER_MAJOR__ < 13) || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ < 1))
+#define _CCCL_ATOMIC_UNSAFE_AUTOMATIC_STORAGE
+#endif
+
+// WAR for libcudacxx/296
+#define CUCO_CUDA_MINIMUM_ARCH _NV_FIRST_ARG(__CUDA_ARCH_LIST__)
+
+#if defined(CUDART_VERSION) && (CUCO_CUDA_MINIMUM_ARCH >= 700)
+#define CUCO_HAS_CUDA_BARRIER
+#endif
+
+#if defined(CUDART_VERSION) && (CUDART_VERSION >= 12010)
+#define CUCO_HAS_CG_INVOKE_ONE
+#endif
+
+#if (CUCO_CUDA_MINIMUM_ARCH >= 700)
+#define CUCO_HAS_INDEPENDENT_THREADS
+#endif
+
+#if defined(__SIZEOF_INT128__)
+#define CUCO_HAS_INT128
+#endif
+
+#if defined(CUCO_HAS_INT128) && (CUCO_CUDA_MINIMUM_ARCH >= 900) && (__cccl_ptx_isa >= 840)
+#define CUCO_HAS_128BIT_ATOMICS
+#endif
+
+#if defined(CUDART_VERSION) && (CUDART_VERSION >= 12000)
+#define CUCO_HAS_CG_REDUCE_UPDATE_ASYNC
+#endif

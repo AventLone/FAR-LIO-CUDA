@@ -1,0 +1,157 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#include <test_utils.hpp>
+
+#include <cuco/detail/__config>
+#include <cuco/static_multiset.cuh>
+
+#include <cuda/functional>
+#include <cuda/iterator>
+#include <thrust/device_vector.h>
+
+#include <catch2/catch_template_test_macros.hpp>
+
+using size_type = int32_t;
+
+template <typename Set>
+void test_unique_sequence(Set& set, size_type num_keys)
+{
+  using Key = typename Set::key_type;
+
+  auto keys_begin = cuda::make_transform_iterator(
+    cuda::counting_iterator<size_type>{0},
+    cuda::proclaim_return_type<Key>([] __device__(auto i) { return Key{i}; }));
+
+  SECTION("Count of empty set should be zero.")
+  {
+    auto const count = set.count(keys_begin, keys_begin + num_keys);
+    REQUIRE(count == 0);
+  }
+
+  set.insert(keys_begin, keys_begin + num_keys);
+
+  SECTION("Count of n unique keys should be n.")
+  {
+    auto const count = set.count(keys_begin, keys_begin + num_keys);
+    REQUIRE(count == num_keys);
+  }
+
+  auto constexpr multiplicity = 3;
+  auto query_begin            = cuda::make_transform_iterator(
+    cuda::counting_iterator<size_type>{0},
+    cuda::proclaim_return_type<Key>([] __device__(auto i) { return Key{i / multiplicity}; }));
+
+  SECTION("Count of 3n unique keys should be 3n.")
+  {
+    auto const count = set.count(query_begin, query_begin + num_keys * multiplicity);
+    REQUIRE(count == num_keys * multiplicity);
+  }
+}
+
+template <typename Set>
+void test_count_each(Set& set, size_type num_keys)
+{
+  using Key = typename Set::key_type;
+
+  thrust::device_vector<size_type> d_counts(num_keys);
+  auto const counts_begin = d_counts.begin();
+
+  auto keys_begin = cuda::make_transform_iterator(
+    cuda::counting_iterator<size_type>{0},
+    cuda::proclaim_return_type<Key>([] __device__(auto i) { return Key{i}; }));
+
+  set.clear();
+
+  SECTION("Count_each of empty set should be all zeros.")
+  {
+    set.count_each(
+      keys_begin, keys_begin + num_keys, set.key_eq(), set.hash_function(), counts_begin);
+    REQUIRE(cuco::test::all_of(
+      d_counts.begin(),
+      d_counts.end(),
+      cuda::proclaim_return_type<bool>([] __device__(size_type count) { return count == 0; })));
+  }
+
+  set.insert(keys_begin, keys_begin + num_keys);
+
+  SECTION("Count_each of n unique keys should be all ones.")
+  {
+    set.count_each(
+      keys_begin, keys_begin + num_keys, set.key_eq(), set.hash_function(), counts_begin);
+    REQUIRE(cuco::test::all_of(
+      d_counts.begin(),
+      d_counts.end(),
+      cuda::proclaim_return_type<bool>([] __device__(size_type count) { return count == 1; })));
+  }
+
+  SECTION("Count_each of missing keys in a populated set should be zero.")
+  {
+    set.count_each(keys_begin + num_keys,
+                   keys_begin + 2 * num_keys,
+                   set.key_eq(),
+                   set.hash_function(),
+                   counts_begin);
+    REQUIRE(cuco::test::all_of(
+      d_counts.begin(),
+      d_counts.end(),
+      cuda::proclaim_return_type<bool>([] __device__(size_type count) { return count == 0; })));
+  }
+
+  set.clear();
+
+  auto constexpr multiplicity = 3;
+  auto duplicate_keys_begin   = cuda::make_transform_iterator(
+    cuda::counting_iterator<size_type>{0},
+    cuda::proclaim_return_type<Key>([] __device__(auto i) { return Key{i / multiplicity}; }));
+  set.insert(duplicate_keys_begin, duplicate_keys_begin + num_keys);
+
+  auto const query_begin = cuda::counting_iterator<size_type>{0};
+  auto const query_size  = num_keys / multiplicity;
+  SECTION("Count_each with duplicates should return correct counts.")
+  {
+    set.count_each(
+      query_begin, query_begin + query_size, set.key_eq(), set.hash_function(), counts_begin);
+    REQUIRE(cuco::test::all_of(d_counts.begin(),
+                               d_counts.begin() + query_size,
+                               cuda::proclaim_return_type<bool>([] __device__(size_type count) {
+                                 return count == multiplicity;
+                               })));
+  }
+}
+
+TEMPLATE_TEST_CASE_SIG(
+  "static_multiset count tests",
+  "",
+  ((typename Key, cuco::test::probe_sequence Probe, int CGSize), Key, Probe, CGSize),
+  (int32_t, cuco::test::probe_sequence::double_hashing, 1),
+  (int32_t, cuco::test::probe_sequence::double_hashing, 2),
+  (int64_t, cuco::test::probe_sequence::double_hashing, 1),
+  (int64_t, cuco::test::probe_sequence::double_hashing, 2),
+  (int32_t, cuco::test::probe_sequence::linear_probing, 1),
+  (int32_t, cuco::test::probe_sequence::linear_probing, 2),
+  (int64_t, cuco::test::probe_sequence::linear_probing, 1),
+  (int64_t, cuco::test::probe_sequence::linear_probing, 2)
+#if defined(CUCO_HAS_128BIT_ATOMICS)
+    ,
+  (__int128_t, cuco::test::probe_sequence::double_hashing, 1),
+  (__int128_t, cuco::test::probe_sequence::double_hashing, 2),
+  (__int128_t, cuco::test::probe_sequence::linear_probing, 1),
+  (__int128_t, cuco::test::probe_sequence::linear_probing, 2)
+#endif
+)
+{
+  constexpr size_type num_keys{666};
+
+  using probe = std::conditional_t<Probe == cuco::test::probe_sequence::linear_probing,
+                                   cuco::linear_probing<CGSize, cuco::default_hash_function<Key>>,
+                                   cuco::double_hashing<CGSize, cuco::default_hash_function<Key>>>;
+
+  auto set =
+    cuco::static_multiset{num_keys, cuco::empty_key<Key>{-1}, {}, probe{}, {}, cuco::storage<2>{}};
+
+  test_unique_sequence(set, num_keys);
+  test_count_each(set, num_keys);
+}

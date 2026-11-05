@@ -1,0 +1,503 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#pragma once
+
+#include <cuco/bloom_filter_policy.cuh>
+#include <cuco/bloom_filter_ref.cuh>
+#include <cuco/detail/storage/storage_base.cuh>
+#include <cuco/detail/utility/strong_type.cuh>
+#include <cuco/extent.cuh>
+#include <cuco/hash_functions.cuh>
+#include <cuco/utility/allocator.hpp>
+#include <cuco/utility/cuda_thread_scope.cuh>
+
+#include <cuda/atomic>
+#include <cuda/std/cstddef>
+#include <cuda/std/type_traits>
+#include <cuda/stream>
+
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+
+namespace cuco {
+
+/**
+ * @brief A strong type wrapper for specifying a Bloom filter storage budget in bytes.
+ */
+CUCO_DEFINE_STRONG_TYPE(bloom_filter_bytes, std::size_t)
+
+/**
+ * @brief A GPU-accelerated Bloom filter.
+ *
+ * The `bloom_filter` supports two operation contexts:
+ * - Host-side bulk operations
+ * - Device-side operations via refs
+ *
+ * The host-side bulk operations include `add()`, `contains()`, etc. These APIs should be used when
+ * there are a large number of keys to add or lookup from host code. For example, given a range of
+ * keys specified by device-accessible iterators, the bulk `add` function will add all keys into
+ * the filter.
+ *
+ * Device-side operations are accessed through non-owning, trivially copyable reference types
+ * (or "ref"). Refs expose per-key `add`/`contains`, cooperative variants that take a Cooperative
+ * Group, and cooperative bulk variants over iterator ranges `[first, last)` for use inside user
+ * kernels.
+ *
+ * The implementation follows the Sectorized Bloom Filter (SBF) design from "Optimizing Bloom
+ * Filters for Modern GPU Architectures" (arXiv:2512.15595,
+ * https://arxiv.org/abs/2512.15595). The bit array is partitioned into fixed-size blocks, each
+ * consisting of several machine-word segments. One block is selected per key by hashing; the key's
+ * fingerprint bits are distributed evenly across the words of that block, confining all probes to
+ * a single block. Fingerprint positions are generated via branchless multiplicative hashing.
+ * Block size, the number of fingerprint bits, and separate horizontal/vertical vectorization
+ * layouts for bulk `add` and `contains` are configured by the `Policy` type (see
+ * `cuco/bloom_filter_policy.cuh`).
+ *
+ * @tparam Key Key type
+ * @tparam Extent Size type that is used to determine the number of blocks in the filter
+ * @tparam Scope The scope in which operations will be performed by individual threads
+ * @tparam Policy Type that defines how to generate and store key fingerprints (see
+ * `cuco/bloom_filter_policy.cuh`)
+ * @tparam Allocator Type of allocator used for device-accessible storage
+ */
+template <class Key,
+          class Extent             = cuco::extent<std::size_t>,
+          cuda::thread_scope Scope = cuda::thread_scope_device,
+          class Policy             = cuco::bloom_filter_policy<Key>,
+          class Allocator          = cuco::cuda_allocator<cuda::std::byte>>
+class bloom_filter {
+ public:
+  /**
+   * @brief Non-owning filter ref type
+   *
+   * @tparam NewScope Thread scope of the to be updated ref type
+   */
+  template <cuda::thread_scope NewScope = Scope>
+  using ref_type = bloom_filter_ref<Key, Extent, NewScope, Policy>;
+
+  static constexpr auto thread_scope = ref_type<>::thread_scope;  ///< CUDA thread scope
+  static constexpr auto words_per_block =
+    ref_type<>::words_per_block;  ///< Number of machine words/segments in each filter block
+
+  using key_type    = typename ref_type<>::key_type;     ///< Key Type
+  using extent_type = typename ref_type<>::extent_type;  ///< Extent type
+  using size_type   = typename extent_type::value_type;  ///< Underlying type of the extent type
+  using word_type =
+    typename ref_type<>::word_type;  ///< Underlying word/segment type of a filter block
+  using allocator_type = typename std::allocator_traits<Allocator>::template rebind_alloc<
+    typename ref_type<>::filter_block_type>;  ///< Allocator
+                                              ///< type
+
+  bloom_filter(bloom_filter const&) = delete;  ///< Copy constructor is not available
+  bloom_filter& operator=(bloom_filter const&) =
+    delete;  ///< Copy-assignment constructor is not available
+
+  bloom_filter(bloom_filter&&) = default;  ///< Move constructor
+
+  /**
+   * @brief Move-assignment operator.
+   *
+   * @return Reference of the current `bloom_filter` object
+   */
+  bloom_filter& operator=(bloom_filter&&) = default;
+
+  ~bloom_filter() = default;  ///< Destructor
+
+  /**
+   * @brief Constructs a statically-sized Bloom filter.
+   *
+   * @param num_blocks Number of sub-filters or blocks
+   * @param scope The scope in which operations will be performed
+   * @param policy Fingerprint generation policy (see `cuco/bloom_filter_policy.cuh`)
+   * @param alloc Allocator used for allocating device-accessible storage
+   * @param stream CUDA stream used to initialize the filter
+   */
+  __host__ explicit bloom_filter(Extent num_blocks,
+                                 cuda_thread_scope<Scope> scope = {},
+                                 Policy const& policy           = {},
+                                 Allocator const& alloc         = {},
+                                 cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}});
+
+  /**
+   * @brief Constructs a Bloom filter within a storage budget in bytes.
+   *
+   * The allocated size is rounded down to a whole number of filter blocks.
+   *
+   * @note This overload requires a dynamic extent.
+   *
+   * @throws cuco::logic_error If the budget is below `min_bytes()` or exceeds `max_bytes()`
+   *
+   * @param bytes Storage budget in bytes
+   * @param scope The scope in which operations will be performed
+   * @param policy Fingerprint generation policy
+   * @param alloc Allocator used for allocating device-accessible storage
+   * @param stream CUDA stream used to initialize the filter
+   */
+  template <class E = Extent,
+            class   = cuda::std::enable_if_t<
+                cuda::std::is_same_v<E, cuco::extent<typename Extent::value_type>>>>
+  __host__ explicit bloom_filter(bloom_filter_bytes bytes,
+                                 cuda_thread_scope<Scope> scope = {},
+                                 Policy const& policy           = {},
+                                 Allocator const& alloc         = {},
+                                 cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}});
+
+  /**
+   * @brief Returns the minimum storage budget in bytes for the byte-budget constructor.
+   *
+   * @note This limit is one filter block and does not account for a particular static extent.
+   *
+   * @return Minimum storage budget in bytes
+   */
+  [[nodiscard]] __host__ static constexpr std::size_t min_bytes() noexcept;
+
+  /**
+   * @brief Returns the maximum storage size in bytes supported by the policy and size type.
+   *
+   * @note This limit does not account for available device memory or a particular static extent.
+   *
+   * @return Maximum storage size in bytes
+   */
+  [[nodiscard]] __host__ static constexpr std::size_t max_bytes() noexcept;
+
+  /**
+   * @brief Erases all information from the filter.
+   *
+   * @note This function synchronizes the given stream. For asynchronous execution use
+   * clear_async().
+   *
+   * @param stream CUDA stream used for device memory operations and kernel launches
+   */
+  __host__ constexpr void clear(cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}});
+
+  /**
+   * @brief Asynchronously erases all information from the filter.
+   *
+   * @param stream CUDA stream used for device memory operations and kernel launches
+   */
+  __host__ constexpr void clear_async(cuda::stream_ref stream = cuda::stream_ref{
+                                        cudaStream_t{nullptr}});
+
+  /**
+   * @brief Adds all keys in the range `[first, last)` to the filter.
+   *
+   * @note This function synchronizes the given stream. For asynchronous execution use
+   * add_async().
+   *
+   * @tparam InputIt Device-accessible random access input key iterator
+   * @param first Beginning of the sequence of keys
+   * @param last End of the sequence of keys
+   * @param stream CUDA stream used for device memory operations and kernel launches
+   */
+  template <class InputIt>
+  __host__ constexpr void add(InputIt first,
+                              InputIt last,
+                              cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}});
+
+  /**
+   * @brief Asynchronously adds all keys in the range `[first, last)` to the filter.
+   *
+   * @tparam InputIt Device-accessible random access input key iterator
+   *
+   * @param first Beginning of the sequence of keys
+   * @param last End of the sequence of keys
+   * @param stream CUDA stream used for device memory operations and kernel launches
+   */
+  template <class InputIt>
+  __host__ constexpr void add_async(InputIt first,
+                                    InputIt last,
+                                    cuda::stream_ref stream = cuda::stream_ref{
+                                      cudaStream_t{nullptr}}) noexcept;
+
+  /**
+   * @brief Adds keys in the range `[first, last)` if `pred` of the corresponding `stencil` returns
+   * `true`.
+   *
+   * @note The key `*(first + i)` is added if `pred( *(stencil + i) )` returns `true`.
+   * @note This function synchronizes the given stream and returns the number of successful
+   * insertions. For asynchronous execution use add_if_async().
+   *
+   * @tparam InputIt Device-accessible random access input key iterator
+   * @tparam StencilIt Device-accessible random-access iterator whose `value_type` is
+   * convertible to Predicate's argument type
+   * @tparam Predicate Unary predicate callable whose return type must be convertible to `bool` and
+   * argument type is convertible from <tt>std::iterator_traits<StencilIt>::value_type</tt>
+   *
+   * @param first Beginning of the sequence of keys
+   * @param last End of the sequence of keys
+   * @param stencil Beginning of the stencil sequence
+   * @param pred Predicate to test on every element in the range `[stencil, stencil +
+   * std::distance(first, last))`
+   * @param stream CUDA stream used for device memory operations and kernel launches
+   */
+  template <class InputIt, class StencilIt, class Predicate>
+  __host__ constexpr void add_if(InputIt first,
+                                 InputIt last,
+                                 StencilIt stencil,
+                                 Predicate pred,
+                                 cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}});
+
+  /**
+   * @brief Asynchronously adds keys in the range `[first, last)` if `pred` of the corresponding
+   * `stencil` returns `true`.
+   *
+   * @note The key `*(first + i)` is added if `pred( *(stencil + i) )` returns `true`.
+   *
+   * @tparam InputIt Device-accessible random access input key iterator
+   * @tparam StencilIt Device-accessible random-access iterator whose `value_type` is
+   * convertible to Predicate's argument type
+   * @tparam Predicate Unary predicate callable whose return type must be convertible to `bool` and
+   * argument type is convertible from <tt>std::iterator_traits<StencilIt>::value_type</tt>
+   *
+   * @param first Beginning of the sequence of keys
+   * @param last End of the sequence of keys
+   * @param stencil Beginning of the stencil sequence
+   * @param pred Predicate to test on every element in the range `[stencil, stencil +
+   * std::distance(first, last))`
+   * @param stream CUDA stream used for device memory operations and kernel launches
+   */
+  template <class InputIt, class StencilIt, class Predicate>
+  __host__ constexpr void add_if_async(InputIt first,
+                                       InputIt last,
+                                       StencilIt stencil,
+                                       Predicate pred,
+                                       cuda::stream_ref stream = cuda::stream_ref{
+                                         cudaStream_t{nullptr}}) noexcept;
+
+  /**
+   * @brief Tests all keys in the range `[first, last)` if their fingerprints are present in the
+   * filter.
+   *
+   * @note This function synchronizes the given stream. For asynchronous execution use
+   * contains_async().
+   *
+   * @tparam InputIt Device-accessible random access input key iterator
+   * @tparam OutputIt Device-accessible output iterator assignable from `bool`
+   *
+   * @param first Beginning of the sequence of keys
+   * @param last End of the sequence of keys
+   * @param output_begin Beginning of the sequence of booleans for the presence of each key
+   * @param stream CUDA stream used for device memory operations and kernel launches
+   */
+  template <class InputIt, class OutputIt>
+  __host__ constexpr void contains(InputIt first,
+                                   InputIt last,
+                                   OutputIt output_begin,
+                                   cuda::stream_ref stream = cuda::stream_ref{
+                                     cudaStream_t{nullptr}}) const;
+
+  /**
+   * @brief Asynchronously tests all keys in the range `[first, last)` if their fingerprints are
+   * present in the filter.
+   *
+   * @tparam InputIt Device-accessible random access input key iterator
+   * @tparam OutputIt Device-accessible output iterator assignable from `bool`
+   *
+   * @param first Beginning of the sequence of keys
+   * @param last End of the sequence of keys
+   * @param output_begin Beginning of the sequence of booleans for the presence of each key
+   * @param stream CUDA stream used for device memory operations and kernel launches
+   */
+  template <class InputIt, class OutputIt>
+  __host__ constexpr void contains_async(InputIt first,
+                                         InputIt last,
+                                         OutputIt output_begin,
+                                         cuda::stream_ref stream = cuda::stream_ref{
+                                           cudaStream_t{nullptr}}) const noexcept;
+
+  /**
+   * @brief Tests all keys in the range `[first, last)` if their fingerprints are present in the
+   * filter if `pred` of the corresponding `stencil` returns `true`.
+   *
+   * @note The key `*(first + i)` is queried if `pred( *(stencil + i) )` returns `true`.
+   * @note This function synchronizes the given stream. For asynchronous execution use
+   * contains_if_async().
+   *
+   * @tparam InputIt Device-accessible random access input key iterator
+   * @tparam StencilIt Device-accessible random-access iterator whose `value_type` is
+   * convertible to Predicate's argument type
+   * @tparam Predicate Unary predicate callable whose return type must be convertible to `bool` and
+   * argument type is convertible from <tt>std::iterator_traits<StencilIt>::value_type</tt>
+   * @tparam OutputIt Device-accessible output iterator assignable from `bool`
+   *
+   * @param first Beginning of the sequence of keys
+   * @param last End of the sequence of keys
+   * @param stencil Beginning of the stencil sequence
+   * @param pred Predicate to test on every element in the range `[stencil, stencil +
+   * std::distance(first, last))`
+   * @param output_begin Beginning of the sequence of booleans for the presence of each key
+   * @param stream CUDA stream used for device memory operations and kernel launches
+   */
+  template <class InputIt, class StencilIt, class Predicate, class OutputIt>
+  __host__ constexpr void contains_if(InputIt first,
+                                      InputIt last,
+                                      StencilIt stencil,
+                                      Predicate pred,
+                                      OutputIt output_begin,
+                                      cuda::stream_ref stream = cuda::stream_ref{
+                                        cudaStream_t{nullptr}}) const;
+
+  /**
+   * @brief Asynchronously tests all keys in the range `[first, last)` if their fingerprints are
+   * present in the filter if `pred` of the corresponding `stencil` returns `true`.
+   *
+   * @note The key `*(first + i)` is queried if `pred( *(stencil + i) )` returns `true`.
+   *
+   * @tparam InputIt Device-accessible random access input key iterator
+   * @tparam StencilIt Device-accessible random-access iterator whose `value_type` is
+   * convertible to Predicate's argument type
+   * @tparam Predicate Unary predicate callable whose return type must be convertible to `bool` and
+   * argument type is convertible from <tt>std::iterator_traits<StencilIt>::value_type</tt>
+   * @tparam OutputIt Device-accessible output iterator assignable from `bool`
+   *
+   * @param first Beginning of the sequence of keys
+   * @param last End of the sequence of keys
+   * @param stencil Beginning of the stencil sequence
+   * @param pred Predicate to test on every element in the range `[stencil, stencil +
+   * std::distance(first, last))`
+   * @param output_begin Beginning of the sequence of booleans for the presence of each key
+   * @param stream CUDA stream used for device memory operations and kernel launches
+   */
+  template <class InputIt, class StencilIt, class Predicate, class OutputIt>
+  __host__ constexpr void contains_if_async(InputIt first,
+                                            InputIt last,
+                                            StencilIt stencil,
+                                            Predicate pred,
+                                            OutputIt output_begin,
+                                            cuda::stream_ref stream = cuda::stream_ref{
+                                              cudaStream_t{nullptr}}) const noexcept;
+
+  /**
+   * @brief Merge another bloom filter into `*this`.
+   *
+   * @note Modifies `this` in place.
+   * @note This function synchronizes the given stream. For asynchronous execution use
+   * merge_async().
+   *
+   * @note This performs the set union of the two filters. Let \f$f : X \to B\f$ denote the
+   * construction of a bloom filter on some set \f$X\f$, and let \f$A\f$ and \f$B\f$ be two sets,
+   * then it holds that \f$f(A \cup B) = f(A) \cup f(B)\f$.
+   *
+   * @param other Other filter with matching type to this. The policy object must be equal to that
+   * of this filter, otherwise behavior is undefined.
+   * @param stream CUDA stream used for device memory operations and kernel launches.
+   *
+   * @throws cuco::logic_error If the other filter does not have the same number of blocks as this.
+   */
+  __host__ constexpr void merge(bloom_filter<Key, Extent, Scope, Policy, Allocator> const& other,
+                                cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}});
+
+  /**
+   * @brief Asynchronously merge another bloom filter into `*this`.
+   *
+   * @note Modifies `this` in place.
+   *
+   * @note This performs the set union of the two filters. Let \f$f : X \to B\f$ denote the
+   * construction of a bloom filter on some set \f$X\f$, and let \f$A\f$ and \f$B\f$ be two sets,
+   * then it holds that \f$f(A \cup B) = f(A) \cup f(B)\f$
+   *
+   * @param other Other filter with matching type to this. The policy object must be equal to that
+   * of this filter, otherwise behavior is undefined.
+   * @param stream CUDA stream used for device memory operations and kernel launches.
+   *
+   * @throws cuco::logic_error If the other filter does not have the same number of blocks as this.
+   */
+  __host__ constexpr void merge_async(
+    bloom_filter<Key, Extent, Scope, Policy, Allocator> const& other,
+    cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}});
+
+  /**
+   * @brief Intersect another bloom filter into `*this`.
+   *
+   * @note Modifies `this` in place.
+   * @note This function synchronizes the given stream. For asynchronous execution use
+   * intersect_async().
+   *
+   * @note This performs the set intersection of the two filters. Unlike merge(), this operation
+   * does not distribute over filter construction and therefore only approximates the bloom filter
+   * of the intersection of the input sets. In other words, let \f$f : X \to B\f$ denote the
+   * construction of a bloom filter on some set \f$X\f$, and let \f$A\f$ and \f$B\f$ be two sets,
+   * then \f$(A \cap B) \ne f(A) \cap f(B)\f$. Despite this, it is guaranteed that for all \f$x \in
+   * (A \cap B)\f$, it holds \f$x \in f(A) \cap f(B)\f$.
+   *
+   * @param other Other filter with matching type to this. The policy object must be equal to that
+   * of this filter, otherwise behavior is undefined.
+   * @param stream CUDA stream used for device memory operations and kernel launches.
+   *
+   * @throws cuco::logic_error If the other filter does not have the same number of blocks as this.
+   */
+  __host__ constexpr void intersect(
+    bloom_filter<Key, Extent, Scope, Policy, Allocator> const& other,
+    cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}});
+
+  /**
+   * @brief Asynchronously intersect another bloom filter into `*this`.
+   *
+   * @note Modifies `this` in place.
+   *
+   * @note This performs the set intersection of the two filters. Unlike merge_async(), this
+   * operation does not distribute over filter construction and therefore only approximates the
+   * bloom filter of the intersection of the input sets. In other words, let \f$f : X \to B\f$
+   * denote the construction of a bloom filter on some set \f$X\f$, and let \f$A\f$ and \f$B\f$ be
+   * two sets, then \f$(A \cap B) \ne f(A) \cap f(B)\f$. Despite this, it is guaranteed that for
+   * all \f$x \in (A \cap B)\f$, it holds \f$x \in f(A) \cap f(B)\f$.
+   *
+   * @param other Other filter with matching type to this. The policy object must be equal to that
+   * of this filter, otherwise behavior is undefined.
+   * @param stream CUDA stream used for device memory operations and kernel launches.
+   *
+   * @throws cuco::logic_error If the other filter does not have the same number of blocks as this.
+   */
+  __host__ constexpr void intersect_async(
+    bloom_filter<Key, Extent, Scope, Policy, Allocator> const& other,
+    cuda::stream_ref stream = cuda::stream_ref{cudaStream_t{nullptr}});
+
+  /**
+   * @brief Gets a pointer to the underlying filter storage.
+   *
+   * @return Pointer to the underlying filter storage
+   */
+  [[nodiscard]] __host__ constexpr word_type* data() noexcept;
+
+  /**
+   * @brief Gets a pointer to the underlying filter storage.
+   *
+   * @return Pointer to the underlying filter storage
+   */
+  [[nodiscard]] __host__ constexpr word_type const* data() const noexcept;
+
+  /**
+   * @brief Gets the number of sub-filter blocks.
+   *
+   * @return Number of sub-filter blocks
+   */
+  [[nodiscard]] __host__ constexpr extent_type block_extent() const noexcept;
+
+  /**
+   * @brief Gets the allocator.
+   *
+   * @return The allocator
+   */
+  [[nodiscard]] __host__ constexpr allocator_type allocator() const noexcept;
+
+  /**
+   * @brief Get device ref.
+   *
+   * @return Device ref of the current `bloom_filter` object
+   */
+  [[nodiscard]] __host__ constexpr ref_type<> ref() const noexcept;
+
+ private:
+  allocator_type allocator_;  ///< Allocator used to allocate device-accessible storage
+  std::unique_ptr<typename ref_type<>::filter_block_type,
+                  detail::custom_deleter<std::size_t, allocator_type>>
+    data_;          ///< Storage of the current `bloom_filter` object
+  ref_type<> ref_;  ///< Device ref of the current `bloom_filter` object
+};
+}  // namespace cuco
+
+#include <cuco/detail/bloom_filter/bloom_filter.inl>

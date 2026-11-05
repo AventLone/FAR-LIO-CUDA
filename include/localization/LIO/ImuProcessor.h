@@ -1,7 +1,11 @@
 #pragma once
 #include <sophus/se3.hpp>
 #include "localization/types/nav_state.hpp"
-#include "localization/types/stamped_cloud.hpp"
+#include "localization/types/deskew.hpp"
+#include <algorithm>
+#include <cmath>
+#include <memory>
+#include <stdexcept>
 
 namespace lio
 {
@@ -31,6 +35,12 @@ public:
      */
     void process(const std::vector<ImuData>& imu_data, StampedCloud& stamped_cloud, const NavState& state)
     {
+        prepareTrajectory(imu_data, stamped_cloud, state);
+        deskew(stamped_cloud);
+    }
+
+    void prepareTrajectory(const std::vector<ImuData>& imu_data, const StampedCloud& stamped_cloud, const NavState& state)
+    {
         if (imu_data.size() < 2)
         {
             throw std::runtime_error("Insufficient IMU measurements.");
@@ -48,10 +58,20 @@ public:
 
         const auto samples = buildImuSequence(imu_data, stamped_cloud.begin_time, stamped_cloud.end_time);
         propagate(samples, state);
-        deskew(stamped_cloud);
     }
 
     static std::vector<ImuData> buildImuSequence(const std::vector<ImuData>& imu_data, double begin, double end);
+
+    std::vector<TimedPose> trajectory() const
+    {
+        std::vector<TimedPose> result;
+        result.reserve(mTrajectory.size());
+        for (const auto& pose : mTrajectory)
+            result.push_back({pose.timestamp, pose.R_wi.unit_quaternion(), pose.p_wi});
+        return result;
+    }
+
+    const Sophus::SE3d& extrinsic() const noexcept { return mT_il; }
 
 private:
     struct PoseState

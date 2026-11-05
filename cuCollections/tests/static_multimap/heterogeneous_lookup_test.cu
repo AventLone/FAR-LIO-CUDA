@@ -1,0 +1,121 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#include <test_utils.hpp>
+
+#include <cuco/static_multimap.cuh>
+
+#include <cuda/functional>
+#include <cuda/iterator>
+#include <thrust/device_vector.h>
+#include <thrust/execution_policy.h>
+#include <thrust/transform.h>
+
+#include <catch2/catch_template_test_macros.hpp>
+
+#include <tuple>
+
+// insert key type
+template <typename T>
+struct key_pair {
+  T a;
+  T b;
+
+  __host__ __device__ key_pair() {}
+  __host__ __device__ key_pair(T x) : a{x}, b{x} {}
+
+  // Device equality operator is mandatory due to libcudacxx bug:
+  // https://github.com/NVIDIA/libcudacxx/issues/223
+  __device__ bool operator==(key_pair const& other) const { return a == other.a and b == other.b; }
+};
+
+// probe key type
+template <typename T>
+struct key_triplet {
+  T a;
+  T b;
+  T c;
+
+  __host__ __device__ key_triplet() {}
+  __host__ __device__ key_triplet(T x) : a{x}, b{x}, c{x} {}
+
+  // Device equality operator is mandatory due to libcudacxx bug:
+  // https://github.com/NVIDIA/libcudacxx/issues/223
+  __device__ bool operator==(key_triplet const& other) const
+  {
+    return a == other.a and b == other.b and c == other.c;
+  }
+};
+
+// User-defined device hasher
+struct custom_hasher {
+  template <typename CustomKey>
+  __device__ uint32_t operator()(CustomKey const& k) const
+  {
+    return thrust::raw_reference_cast(k).a;
+  };
+};
+
+// User-defined device key equality
+struct custom_key_equal {
+  template <typename LHS, typename RHS>
+  __device__ bool operator()(LHS const& lhs, RHS const& rhs) const
+  {
+    return thrust::raw_reference_cast(lhs).a == thrust::raw_reference_cast(rhs).a;
+  }
+};
+
+// TODO: extend with __int128_t once the multimap can handle slots larger than
+// 32 bytes (key_pair<__int128_t> is 32 bytes, so pair<key_pair<__int128_t>, V>
+// exceeds the current slot-size budget).
+TEMPLATE_TEST_CASE(
+  "static_multimap heterogeneous lookup tests",
+  "",
+  int32_t)  // key_pair<int32_t> = 8 bytes, key_pair<int64_t> = 16 bytes (exceeds 8-byte limit)
+{
+  using Key      = key_pair<TestType>;
+  using Value    = TestType;
+  using ProbeKey = key_triplet<TestType>;
+
+  auto const sentinel_key   = Key{-1};
+  auto const sentinel_value = Value{-1};
+
+  constexpr std::size_t num      = 100;
+  constexpr std::size_t capacity = num * 2;
+  cuco::static_multimap<Key,
+                        Value,
+                        cuco::extent<std::size_t>,
+                        cuda::thread_scope_device,
+                        custom_key_equal,
+                        cuco::linear_probing<1, custom_hasher>,
+                        cuco::cuda_allocator<cuda::std::byte>,
+                        cuco::storage<2>>
+    map{cuco::extent<std::size_t>{capacity},
+        cuco::empty_key<Key>{sentinel_key},
+        cuco::empty_value<Value>{sentinel_value}};
+
+  auto insert_pairs = cuda::make_transform_iterator(
+    cuda::counting_iterator<int>(0),
+    cuda::proclaim_return_type<cuco::pair<Key, Value>>(
+      [] __device__(auto i) { return cuco::pair<Key, Value>(i, i); }));
+  auto probe_keys = cuda::make_transform_iterator(
+    cuda::counting_iterator<int>(0),
+    cuda::proclaim_return_type<ProbeKey>([] __device__(auto i) { return ProbeKey(i); }));
+
+  SECTION("All inserted keys-value pairs should be contained")
+  {
+    thrust::device_vector<bool> contained(num);
+    map.insert(insert_pairs, insert_pairs + num);
+    map.contains(probe_keys, probe_keys + num, contained.begin());
+    REQUIRE(cuco::test::all_of(contained.begin(), contained.end(), cuda::std::identity{}));
+  }
+
+  SECTION("Non-inserted keys-value pairs should not be contained")
+  {
+    thrust::device_vector<bool> contained(num);
+    map.contains(probe_keys, probe_keys + num, contained.begin());
+    REQUIRE(cuco::test::none_of(contained.begin(), contained.end(), cuda::std::identity{}));
+  }
+}

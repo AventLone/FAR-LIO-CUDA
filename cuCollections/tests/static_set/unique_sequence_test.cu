@@ -1,0 +1,189 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#include <test_utils.hpp>
+
+#include <cuco/detail/__config>
+#include <cuco/static_set.cuh>
+
+#include <cuda/functional>
+#include <cuda/iterator>
+#include <cuda/std/tuple>
+#include <thrust/device_vector.h>
+#include <thrust/distance.h>
+#include <thrust/sort.h>
+#include <thrust/transform.h>
+
+#include <catch2/catch_template_test_macros.hpp>
+
+#include <cstdint>
+
+using size_type = int32_t;
+
+int32_t constexpr SENTINEL = -1;
+
+template <typename Set>
+void test_unique_sequence(Set& set, size_type num_keys)
+{
+  using Key = typename Set::key_type;
+
+  auto keys_begin = cuda::counting_iterator<Key>{0};
+  thrust::device_vector<bool> d_contained(num_keys);
+
+  auto zip_equal = cuda::proclaim_return_type<bool>(
+    [] __device__(auto const& p) { return cuda::std::get<0>(p) == cuda::std::get<1>(p); });
+  auto is_even =
+    cuda::proclaim_return_type<bool>([] __device__(auto const& i) { return i % 2 == 0; });
+
+  SECTION("Non-inserted keys should not be contained.")
+  {
+    REQUIRE(set.size() == 0);
+
+    set.contains(keys_begin, keys_begin + num_keys, d_contained.begin());
+    REQUIRE(cuco::test::none_of(d_contained.begin(), d_contained.end(), cuda::std::identity{}));
+  }
+
+  SECTION("Non-inserted keys have no matches")
+  {
+    thrust::device_vector<Key> d_results(num_keys);
+
+    set.find(keys_begin, keys_begin + num_keys, d_results.begin());
+    auto zip = thrust::make_zip_iterator(
+      cuda::std::tuple{d_results.begin(), cuda::constant_iterator<Key>{set.empty_key_sentinel()}});
+
+    REQUIRE(cuco::test::all_of(zip, zip + num_keys, zip_equal));
+  }
+
+  SECTION("All conditionally inserted keys should be contained")
+  {
+    auto const inserted = set.insert_if(
+      keys_begin, keys_begin + num_keys, cuda::counting_iterator<std::size_t>(0), is_even);
+    REQUIRE(inserted == num_keys / 2);
+    REQUIRE(set.size() == num_keys / 2);
+
+    set.contains(keys_begin, keys_begin + num_keys, d_contained.begin());
+    REQUIRE(cuco::test::equal(
+      d_contained.begin(),
+      d_contained.end(),
+      cuda::counting_iterator<std::size_t>(0),
+      cuda::proclaim_return_type<bool>([] __device__(auto const& idx_contained, auto const& idx) {
+        return ((idx % 2) == 0) == idx_contained;
+      })));
+  }
+
+  set.clear();
+  auto const inserted = set.insert(keys_begin, keys_begin + num_keys);
+  REQUIRE(inserted == num_keys);
+  REQUIRE(set.size() == num_keys);
+
+  SECTION("All inserted keys should be contained.")
+  {
+    set.contains(keys_begin, keys_begin + num_keys, d_contained.begin());
+    REQUIRE(cuco::test::all_of(d_contained.begin(), d_contained.end(), cuda::std::identity{}));
+  }
+
+  SECTION("Conditional contains should return true on even inputs.")
+  {
+    set.contains_if(keys_begin,
+                    keys_begin + num_keys,
+                    cuda::counting_iterator<std::size_t>(0),
+                    is_even,
+                    d_contained.begin());
+    auto gold_iter =
+      cuda::make_transform_iterator(cuda::counting_iterator<std::size_t>(0), is_even);
+    auto zip = thrust::make_zip_iterator(cuda::std::tuple{d_contained.begin(), gold_iter});
+    REQUIRE(cuco::test::all_of(zip, zip + num_keys, zip_equal));
+  }
+
+  SECTION("All inserted keys should be correctly recovered during find")
+  {
+    thrust::device_vector<Key> d_results(num_keys);
+
+    set.find(keys_begin, keys_begin + num_keys, d_results.begin());
+    auto zip = thrust::make_zip_iterator(cuda::std::tuple{d_results.begin(), keys_begin});
+
+    REQUIRE(cuco::test::all_of(zip, zip + num_keys, zip_equal));
+  }
+
+  SECTION("Conditional find should return valid values on even inputs.")
+  {
+    auto found_results = thrust::device_vector<Key>(num_keys);
+    auto gold_fn       = cuda::proclaim_return_type<Key>(
+      [] __device__(auto const& i) { return i % 2 == 0 ? static_cast<Key>(i) : Key{SENTINEL}; });
+
+    set.find_if(keys_begin,
+                keys_begin + num_keys,
+                cuda::counting_iterator<std::size_t>{0},
+                is_even,
+                found_results.begin());
+
+    REQUIRE(cuco::test::equal(
+      found_results.begin(),
+      found_results.end(),
+      cuda::make_transform_iterator(cuda::counting_iterator<Key>{0}, gold_fn),
+      cuda::proclaim_return_type<bool>(
+        [] __device__(auto const& found, auto const& gold) { return found == gold; })));
+  }
+}
+
+TEMPLATE_TEST_CASE_SIG(
+  "static_set unique sequence tests",
+  "",
+  ((typename Key, cuco::test::probe_sequence Probe, int CGSize), Key, Probe, CGSize),
+  (int8_t, cuco::test::probe_sequence::double_hashing, 1),
+  (int8_t, cuco::test::probe_sequence::linear_probing, 1),
+  (int8_t, cuco::test::probe_sequence::linear_probing, 2),
+  (int16_t, cuco::test::probe_sequence::double_hashing, 1),
+  (int16_t, cuco::test::probe_sequence::double_hashing, 2),
+  (int16_t, cuco::test::probe_sequence::linear_probing, 1),
+  (int16_t, cuco::test::probe_sequence::linear_probing, 2),
+  (int32_t, cuco::test::probe_sequence::double_hashing, 1),
+  (int32_t, cuco::test::probe_sequence::double_hashing, 2),
+  (int64_t, cuco::test::probe_sequence::double_hashing, 1),
+  (int64_t, cuco::test::probe_sequence::double_hashing, 2),
+  (int32_t, cuco::test::probe_sequence::linear_probing, 1),
+  (int32_t, cuco::test::probe_sequence::linear_probing, 2),
+  (int64_t, cuco::test::probe_sequence::linear_probing, 1),
+  (int64_t, cuco::test::probe_sequence::linear_probing, 2)
+#if defined(CUCO_HAS_128BIT_ATOMICS)
+    ,
+  (__int128_t, cuco::test::probe_sequence::double_hashing, 1),
+  (__int128_t, cuco::test::probe_sequence::double_hashing, 2),
+  (__int128_t, cuco::test::probe_sequence::linear_probing, 1),
+  (__int128_t, cuco::test::probe_sequence::linear_probing, 2)
+#endif
+)
+{
+  // Limit key count for small types: leave room for the -1 sentinel
+  constexpr size_type num_keys = (sizeof(Key) == 1) ? 100 : 400;
+  using probe = std::conditional_t<Probe == cuco::test::probe_sequence::linear_probing,
+                                   cuco::linear_probing<CGSize, cuco::default_hash_function<Key>>,
+                                   cuco::double_hashing<CGSize, cuco::default_hash_function<Key>>>;
+
+  constexpr size_type gold_capacity = [&]() {
+    if constexpr (cuco::is_double_hashing<probe>::value) {
+      if constexpr (num_keys == 100) {
+        return (CGSize == 1) ? 106  // 53 x 1 x 2
+                             : 106;
+      } else {
+        return (CGSize == 1) ? 422   // 211 x 1 x 2
+                             : 404;  // 101 x 2 x 2
+      }
+    } else {
+      return num_keys;
+    }
+  }();
+
+  auto set = cuco::static_set{num_keys,
+                              cuco::empty_key<Key>{static_cast<Key>(SENTINEL)},
+                              {},
+                              probe{},
+                              {},
+                              cuco::storage<2>{}};
+
+  REQUIRE(set.capacity() == gold_capacity);
+
+  test_unique_sequence(set, num_keys);
+}

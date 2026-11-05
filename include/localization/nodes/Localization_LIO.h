@@ -9,8 +9,6 @@
 #include <tf2_eigen/tf2_eigen.hpp>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
-#include <pcl/common/transforms.h>
-#include <pcl/filters/voxel_grid.h>
 #include "localization/GICP/GICP.h"
 #include "localization/LIO/ESKF.h"
 #include "localization/LIO/ImuProcessor.h"
@@ -111,7 +109,6 @@ private:
     Eigen::Isometry3f T_truck2lidar;
 
     /* Trailer voxel map and estimated pose */
-    pcl::PointCloud<pcl::PointXYZ>::Ptr mMap;
     nav_msgs::msg::Path mBasePosePath;
 
     /* LIO */
@@ -175,12 +172,11 @@ private:
     //     pcl::transformPointCloud(src_scan, dst_scan, T_truck2lidar);
     // }
 
-    pcl::PointCloud<pcl::PointXYZ>::Ptr denoiseAndDownsample(const pcl::PointCloud<pcl::PointXYZI>& src) const;
-    pcl::PointCloud<pcl::PointXYZ>::Ptr denoiseAndDownsample(const StampedCloud& src) const;
+    GICP::PreprocessConfig preprocessing() const;
 
-    bool alignScanToMap(const pcl::PointCloud<pcl::PointXYZ>::Ptr& current_scan);
+    bool alignScanToMap();
 
-    void updateVoxelMap(const pcl::PointCloud<pcl::PointXYZ>& scan);
+    void updateVoxelMap();
 
     void workerLoop();
 };

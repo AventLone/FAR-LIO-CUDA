@@ -1,0 +1,130 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#include <test_utils.hpp>
+
+#include <cuco/detail/__config>
+#include <cuco/static_multimap.cuh>
+
+#include <cuda/functional>
+#include <cuda/iterator>
+#include <cuda/std/tuple>
+#include <thrust/device_vector.h>
+#include <thrust/functional.h>
+
+#include <catch2/catch_template_test_macros.hpp>
+
+using size_type = int32_t;
+
+int32_t constexpr KEY_SENTINEL = -1;
+int32_t constexpr VAL_SENTINEL = -2;
+
+template <typename Map>
+void test_multimap_find(Map& map, size_type num_keys)
+{
+  using Key   = typename Map::key_type;
+  using Value = typename Map::mapped_type;
+
+  auto zip_equal = cuda::proclaim_return_type<bool>(
+    [] __device__(auto val) { return cuda::std::get<0>(val) == cuda::std::get<1>(val); });
+
+  auto const keys_begin = cuda::counting_iterator<Key>{0};
+
+  SECTION("Non-inserted keys have no matches")
+  {
+    thrust::device_vector<Value> found_vals(num_keys);
+
+    map.find(keys_begin, keys_begin + num_keys, found_vals.begin());
+    auto zip = thrust::make_zip_iterator(cuda::std::tuple{
+      found_vals.begin(), cuda::constant_iterator<Value>{map.empty_value_sentinel()}});
+
+    REQUIRE(cuco::test::all_of(zip, zip + num_keys, zip_equal));
+  }
+
+  auto const pairs_begin = cuda::make_transform_iterator(
+    cuda::make_counting_iterator<size_type>(0),
+    cuda::proclaim_return_type<cuco::pair<Key, Value>>(
+      [] __device__(auto i) { return cuco::pair<Key, Value>{i, i * 2}; }));
+
+  map.insert(pairs_begin, pairs_begin + num_keys);
+
+  SECTION("All inserted keys should be correctly recovered during find")
+  {
+    thrust::device_vector<Value> found_vals(num_keys);
+
+    map.find(keys_begin, keys_begin + num_keys, found_vals.begin());
+
+    auto const gold_vals_begin = cuda::make_transform_iterator(
+      cuda::make_counting_iterator<size_type>(0),
+      cuda::proclaim_return_type<Value>([] __device__(auto i) { return Value{i * 2}; }));
+    auto zip = thrust::make_zip_iterator(cuda::std::tuple{found_vals.begin(), gold_vals_begin});
+
+    REQUIRE(cuco::test::all_of(zip, zip + num_keys, zip_equal));
+  }
+
+  SECTION("Conditional find should return valid values on even inputs.")
+  {
+    auto found_results = thrust::device_vector<Key>(num_keys);
+    auto is_even =
+      cuda::proclaim_return_type<bool>([] __device__(auto const& i) { return i % 2 == 0; });
+    auto gold_fn = cuda::proclaim_return_type<Value>([] __device__(auto const& i) {
+      return i % 2 == 0 ? static_cast<Value>(i) * 2 : Value{VAL_SENTINEL};
+    });
+
+    map.find_if(keys_begin,
+                keys_begin + num_keys,
+                cuda::counting_iterator<std::size_t>{0},
+                is_even,
+                found_results.begin());
+
+    REQUIRE(cuco::test::equal(
+      found_results.begin(),
+      found_results.end(),
+      cuda::make_transform_iterator(cuda::counting_iterator<Key>{0}, gold_fn),
+      cuda::proclaim_return_type<bool>(
+        [] __device__(auto const& found, auto const& gold) { return found == gold; })));
+  }
+}
+
+TEMPLATE_TEST_CASE_SIG(
+  "static_multimap find tests",
+  "",
+  ((typename T, cuco::test::probe_sequence Probe, int CGSize), T, Probe, CGSize),
+  (int32_t, cuco::test::probe_sequence::double_hashing, 1),
+  (int32_t, cuco::test::probe_sequence::double_hashing, 2),
+  (int64_t, cuco::test::probe_sequence::double_hashing, 1),
+  (int64_t, cuco::test::probe_sequence::double_hashing, 2),
+  (int32_t, cuco::test::probe_sequence::linear_probing, 1),
+  (int32_t, cuco::test::probe_sequence::linear_probing, 2),
+  (int64_t, cuco::test::probe_sequence::linear_probing, 1),
+  (int64_t, cuco::test::probe_sequence::linear_probing, 2)
+#if defined(CUCO_HAS_128BIT_ATOMICS)
+    ,
+  (__int128_t, cuco::test::probe_sequence::double_hashing, 1),
+  (__int128_t, cuco::test::probe_sequence::double_hashing, 2),
+  (__int128_t, cuco::test::probe_sequence::linear_probing, 1),
+  (__int128_t, cuco::test::probe_sequence::linear_probing, 2)
+#endif
+)
+{
+  constexpr size_type num_keys{1'000};
+
+  using probe = std::conditional_t<
+    Probe == cuco::test::probe_sequence::linear_probing,
+    cuco::linear_probing<CGSize, cuco::default_hash_function<T>>,
+    cuco::double_hashing<CGSize, cuco::default_hash_function<T>, cuco::default_hash_function<T>>>;
+
+  auto map = cuco::static_multimap<T,
+                                   T,
+                                   cuco::extent<size_type>,
+                                   cuda::thread_scope_device,
+                                   cuda::std::equal_to<T>,
+                                   probe,
+                                   cuco::cuda_allocator<cuda::std::byte>,
+                                   cuco::storage<2>>{
+    num_keys, cuco::empty_key<T>{KEY_SENTINEL}, cuco::empty_value<T>{VAL_SENTINEL}};
+
+  test_multimap_find(map, num_keys);
+}

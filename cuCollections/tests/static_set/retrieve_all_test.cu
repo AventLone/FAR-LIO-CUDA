@@ -1,0 +1,107 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#include <test_utils.hpp>
+
+#include <cuco/detail/__config>
+#include <cuco/static_set.cuh>
+
+#include <cuda/iterator>
+#include <cuda/std/functional>
+#include <thrust/device_vector.h>
+#include <thrust/sequence.h>
+#include <thrust/sort.h>
+
+#include <catch2/catch_template_test_macros.hpp>
+
+#include <cstdint>
+
+template <typename Set>
+void test_unique_sequence(Set& set, std::size_t num_keys)
+{
+  using Key = typename Set::key_type;
+
+  thrust::device_vector<Key> d_keys(num_keys);
+  thrust::sequence(d_keys.begin(), d_keys.end());
+  auto keys_begin = d_keys.begin();
+
+  SECTION("Non-inserted keys should not be contained.")
+  {
+    REQUIRE(set.size() == 0);
+
+    auto keys_end = set.retrieve_all(keys_begin);
+    REQUIRE(std::distance(keys_begin, keys_end) == 0);
+  }
+
+  set.insert(keys_begin, keys_begin + num_keys);
+  REQUIRE(set.size() == num_keys);
+
+  SECTION("All inserted key/value pairs should be contained.")
+  {
+    thrust::device_vector<Key> d_res(num_keys);
+    auto d_res_end = set.retrieve_all(d_res.begin());
+    thrust::sort(d_res.begin(), d_res_end);
+    REQUIRE(cuco::test::equal(
+      d_res.begin(), d_res_end, cuda::counting_iterator<Key>(0), cuda::std::equal_to<Key>{}));
+  }
+}
+
+TEMPLATE_TEST_CASE_SIG(
+  "static_set::retrieve_all tests",
+  "",
+  ((typename Key, cuco::test::probe_sequence Probe, int CGSize), Key, Probe, CGSize),
+  (int8_t, cuco::test::probe_sequence::double_hashing, 1),
+  (int8_t, cuco::test::probe_sequence::linear_probing, 1),
+  (int8_t, cuco::test::probe_sequence::linear_probing, 2),
+  (int16_t, cuco::test::probe_sequence::double_hashing, 1),
+  (int16_t, cuco::test::probe_sequence::double_hashing, 2),
+  (int16_t, cuco::test::probe_sequence::linear_probing, 1),
+  (int16_t, cuco::test::probe_sequence::linear_probing, 2),
+  (int32_t, cuco::test::probe_sequence::double_hashing, 1),
+  (int32_t, cuco::test::probe_sequence::double_hashing, 2),
+  (int64_t, cuco::test::probe_sequence::double_hashing, 1),
+  (int64_t, cuco::test::probe_sequence::double_hashing, 2),
+  (int32_t, cuco::test::probe_sequence::linear_probing, 1),
+  (int32_t, cuco::test::probe_sequence::linear_probing, 2),
+  (int64_t, cuco::test::probe_sequence::linear_probing, 1),
+  (int64_t, cuco::test::probe_sequence::linear_probing, 2)
+#if defined(CUCO_HAS_128BIT_ATOMICS)
+    ,
+  (__int128_t, cuco::test::probe_sequence::double_hashing, 1),
+  (__int128_t, cuco::test::probe_sequence::double_hashing, 2),
+  (__int128_t, cuco::test::probe_sequence::linear_probing, 1),
+  (__int128_t, cuco::test::probe_sequence::linear_probing, 2)
+#endif
+)
+{
+  // Limit key count for small types: leave room for the -1 sentinel
+  constexpr std::size_t num_keys       = (sizeof(Key) == 1) ? 100 : 400;
+  constexpr double desired_load_factor = 1.;
+
+  using probe = std::conditional_t<Probe == cuco::test::probe_sequence::linear_probing,
+                                   cuco::linear_probing<CGSize, cuco::default_hash_function<Key>>,
+                                   cuco::double_hashing<CGSize, cuco::default_hash_function<Key>>>;
+
+  constexpr std::size_t gold_capacity = [&]() {
+    if constexpr (cuco::is_double_hashing<probe>::value) {
+      if constexpr (num_keys == 100) {
+        return (CGSize == 1) ? 101   // 101 x 1 x 1
+                             : 106;  // 53 x 2 x 1
+      } else {
+        return (CGSize == 1) ? 401   // 401 x 1 x 1
+                             : 422;  // 211 x 2 x 1
+      }
+    } else {
+      return num_keys;
+    }
+  }();
+
+  auto set = cuco::static_set{
+    num_keys, desired_load_factor, cuco::empty_key<Key>{static_cast<Key>(-1)}, {}, probe{}};
+
+  REQUIRE(set.capacity() == gold_capacity);
+
+  test_unique_sequence(set, num_keys);
+}

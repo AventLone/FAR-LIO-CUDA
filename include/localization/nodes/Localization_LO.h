@@ -9,8 +9,6 @@
 #include <tf2_eigen/tf2_eigen.hpp>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
-#include <pcl/common/transforms.h>
-#include <pcl/filters/voxel_grid.h>
 #include <tf2_ros/transform_broadcaster.hpp>
 #include "localization/GICP/GICP.h"
 #include "localization/types/common.hpp"
@@ -18,25 +16,25 @@
 
 class Localization_LO : public rclcpp::Node
 {
-    static constexpr bool PRINT_BENCHMARK = false;
+    static constexpr bool PRINT_BENCHMARK = true;
     static constexpr float MAP_RESOLUTION = SparseVoxel::MIN_DIST;
 public:
     explicit Localization_LO(const std::string& node_name) : Node(node_name), mTfBuffer(this->get_clock()), mTfListener(mTfBuffer),
         mTfBroadcaster(std::make_unique<tf2_ros::TransformBroadcaster>(*this))
     {
         /* Lookup transform */
-        while (rclcpp::ok())
-        {
-            try
-            {
-                T_truck2lidar = tf2::transformToEigen(mTfBuffer.lookupTransform("LOLA", "JT128", tf2::TimePointZero)).cast<float>();
-                break;
-            }
-            catch (const tf2::TransformException& ex)
-            {
-                RCLCPP_ERROR_THROTTLE(this->get_logger(), *get_clock(), 2000, "Could not transform fork to body: %s", ex.what());
-            }
-        }
+        // while (rclcpp::ok())
+        // {
+        //     try
+        //     {
+        //         T_truck2lidar = tf2::transformToEigen(mTfBuffer.lookupTransform("LOLA", "JT128", tf2::TimePointZero)).cast<float>();
+        //         break;
+        //     }
+        //     catch (const tf2::TransformException& ex)
+        //     {
+        //         RCLCPP_ERROR_THROTTLE(this->get_logger(), *get_clock(), 2000, "Could not transform fork to body: %s", ex.what());
+        //     }
+        // }
 
         GICP::Config config{};
         config.max_fitness_score = 0.1f;  // 平均意义下的点位误差尺度 10 cm
@@ -87,11 +85,11 @@ private:
     /* TF tree utilities */
     tf2_ros::Buffer mTfBuffer;
     tf2_ros::TransformListener mTfListener;
-    Eigen::Isometry3f T_truck2lidar;
+    // Eigen::Isometry3f T_truck2lidar;
     std::unique_ptr<tf2_ros::TransformBroadcaster> mTfBroadcaster;
 
     /* Trailer voxel map and estimated pose */
-    pcl::PointCloud<pcl::PointXYZ>::Ptr mCloudMap;
+    bool mMapInitialized{false};
     Eigen::Isometry3d mBasePose{Eigen::Isometry3d::Identity()};   // Pose of the truck
     nav_msgs::msg::Path mBasePosePath;
     ROI mTrailerRoi{};
@@ -105,9 +103,10 @@ private:
 
     void initSubscribers()
     {
-        mLidarScanSub = create_subscription<sensor_msgs::msg::PointCloud2>("/sim_scan", rclcpp::SensorDataQoS(),
+        // mLidarScanSub = create_subscription<sensor_msgs::msg::PointCloud2>("/sim_scan", rclcpp::SensorDataQoS(),
         // mLidarScanSub = create_subscription<sensor_msgs::msg::PointCloud2>("/rslidar_points", 5,
-        // mLidarScanSub = create_subscription<sensor_msgs::msg::PointCloud2>("/hesai/pandar", 10,
+        mLidarScanSub = create_subscription<sensor_msgs::msg::PointCloud2>("/hesai/pandar", 10,
+        // mLidarScanSub = create_subscription<sensor_msgs::msg::PointCloud2>("/velodyne_points", 10,
         // mLidarScanSub = create_subscription<sensor_msgs::msg::PointCloud2>("/iv_points", 10,
             [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr scan_msg)
                 {
@@ -140,11 +139,7 @@ private:
     //     pcl::transformPointCloud(src_scan, dst_scan, T_truck2lidar);
     // }
 
-    bool alignICP(const pcl::PointCloud<pcl::PointXYZ>::Ptr& current_scan);
-
     void recordGicpDuration(double duration_ms);
-
-    void updateVoxelMap(const pcl::PointCloud<pcl::PointXYZ>& scan_in_base_link);
 
     void workerLoop();
 };

@@ -1,0 +1,180 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#pragma once
+
+#include <cuco/detail/storage/functors.cuh>
+#include <cuco/detail/utility/assert.cuh>
+#include <cuco/detail/utility/cuda.hpp>
+#include <cuco/extent.cuh>
+
+#include <cub/device/device_for.cuh>
+#include <cuda/std/bit>
+#include <cuda/std/cstdint>
+#include <cuda/stream>
+
+#if defined(CUCO_DEBUG)
+#include <cuda/std/type_traits>
+#endif
+
+#include <cassert>
+#include <memory>
+
+namespace cuco {
+
+template <typename T, int BucketSize, typename Extent>
+__host__ __device__ constexpr bucket_storage_ref<T, BucketSize, Extent>::bucket_storage_ref(
+  Extent size, value_type* slots) noexcept
+  : extent_{size}, slots_{slots}
+{
+  static_assert(cuda::std::has_single_bit(alignment), "Alignment must be a power of 2");
+  assert(reinterpret_cast<cuda::std::uintptr_t>(slots) % alignment == 0 &&
+         "Storage must be properly aligned");
+}
+
+template <typename T, int BucketSize, typename Extent>
+__host__ __device__ constexpr bucket_storage_ref<T, BucketSize, Extent>::iterator
+bucket_storage_ref<T, BucketSize, Extent>::end() noexcept
+{
+  return iterator{reinterpret_cast<value_type*>(this->data() + this->capacity())};
+}
+
+template <typename T, int BucketSize, typename Extent>
+__host__ __device__ constexpr bucket_storage_ref<T, BucketSize, Extent>::iterator
+bucket_storage_ref<T, BucketSize, Extent>::end() const noexcept
+{
+  return iterator{reinterpret_cast<value_type*>(this->data() + this->capacity())};
+}
+
+template <typename T, int BucketSize, typename Extent>
+__host__ __device__ constexpr bucket_storage_ref<T, BucketSize, Extent>::value_type*
+bucket_storage_ref<T, BucketSize, Extent>::data() noexcept
+{
+  return slots_;
+}
+
+template <typename T, int BucketSize, typename Extent>
+__host__ __device__ constexpr bucket_storage_ref<T, BucketSize, Extent>::value_type*
+bucket_storage_ref<T, BucketSize, Extent>::data() const noexcept
+{
+  return slots_;
+}
+
+template <typename T, int BucketSize, typename Extent>
+__device__ constexpr bucket_storage_ref<T, BucketSize, Extent>::bucket_type
+bucket_storage_ref<T, BucketSize, Extent>::operator[](size_type index) const noexcept
+{
+#if defined(CUCO_DEBUG)
+  if constexpr (cuda::std::is_signed_v<size_type>) {
+    CUCO_DEBUG_ASSERT(index >= size_type{0}, "Bucket access precedes storage");
+  }
+  CUCO_DEBUG_ASSERT(index <= this->capacity() && bucket_size <= this->capacity() - index,
+                    "Bucket access exceeds storage capacity");
+#endif
+  return *reinterpret_cast<bucket_type*>(this->data() + index);
+}
+
+template <typename T, int BucketSize, typename Extent>
+__host__ __device__ constexpr typename bucket_storage_ref<T, BucketSize, Extent>::size_type
+bucket_storage_ref<T, BucketSize, Extent>::num_buckets() const noexcept
+{
+  return static_cast<size_type>(extent_) / bucket_size;
+}
+
+template <typename T, int BucketSize, typename Extent>
+__host__ __device__ constexpr typename bucket_storage_ref<T, BucketSize, Extent>::size_type
+bucket_storage_ref<T, BucketSize, Extent>::capacity() const noexcept
+{
+  return static_cast<size_type>(extent_);
+}
+
+template <typename T, int BucketSize, typename Extent>
+__host__ __device__ constexpr typename bucket_storage_ref<T, BucketSize, Extent>::extent_type
+bucket_storage_ref<T, BucketSize, Extent>::extent() const noexcept
+{
+  return extent_;
+}
+
+template <typename T, int BucketSize, typename Extent, typename Allocator>
+constexpr bucket_storage<T, BucketSize, Extent, Allocator>::bucket_storage(
+  Extent size, Allocator const& allocator, cuda::stream_ref stream)
+  : extent_{size}, allocator_{allocator}, slots_{[this, &stream]() {
+      constexpr std::size_t align  = ref_type::alignment;
+      constexpr std::size_t extra  = (align - 1) / sizeof(value_type) + 1;
+      std::size_t const alloc_size = static_cast<std::size_t>(capacity()) + extra;
+      auto* const raw_ptr          = allocator_.allocate(alloc_size, stream);
+      auto* const aligned_ptr      = reinterpret_cast<value_type*>(
+        (reinterpret_cast<cuda::std::uintptr_t>(raw_ptr) + align - 1) & ~(align - 1));
+      return std::unique_ptr<value_type, aligned_deleter>{
+        aligned_ptr, aligned_deleter{raw_ptr, alloc_size, allocator_, stream}};
+    }()}
+{
+}
+
+template <typename T, int BucketSize, typename Extent, typename Allocator>
+constexpr bucket_storage<T, BucketSize, Extent, Allocator>::value_type*
+bucket_storage<T, BucketSize, Extent, Allocator>::data() const noexcept
+{
+  return slots_.get();
+}
+
+template <typename T, int BucketSize, typename Extent, typename Allocator>
+constexpr bucket_storage<T, BucketSize, Extent, Allocator>::allocator_type
+bucket_storage<T, BucketSize, Extent, Allocator>::allocator() const noexcept
+{
+  return allocator_;
+}
+
+template <typename T, int BucketSize, typename Extent, typename Allocator>
+constexpr bucket_storage<T, BucketSize, Extent, Allocator>::ref_type
+bucket_storage<T, BucketSize, Extent, Allocator>::ref() const noexcept
+{
+  return ref_type{this->extent(), this->data()};
+}
+
+template <typename T, int BucketSize, typename Extent, typename Allocator>
+void bucket_storage<T, BucketSize, Extent, Allocator>::initialize(value_type key,
+                                                                  cuda::stream_ref stream)
+{
+  this->initialize_async(key, stream);
+#if CCCL_MAJOR_VERSION > 3 || (CCCL_MAJOR_VERSION == 3 && CCCL_MINOR_VERSION >= 1)
+  stream.sync();
+#else
+  stream.wait();
+#endif
+}
+
+template <typename T, int BucketSize, typename Extent, typename Allocator>
+void bucket_storage<T, BucketSize, Extent, Allocator>::initialize_async(value_type key,
+                                                                        cuda::stream_ref stream)
+{
+  if (this->capacity() == 0) { return; }
+
+  auto ftor = cuco::detail::initialize_functor<size_type, T>{this->data(), key};
+  CUCO_CUDA_TRY(cub::DeviceFor::Bulk(this->capacity(), ftor, stream.get()));
+}
+
+template <typename T, int BucketSize, typename Extent, typename Allocator>
+__host__ __device__ constexpr typename bucket_storage<T, BucketSize, Extent, Allocator>::size_type
+bucket_storage<T, BucketSize, Extent, Allocator>::num_buckets() const noexcept
+{
+  return static_cast<size_type>(extent_) / bucket_size;
+}
+
+template <typename T, int BucketSize, typename Extent, typename Allocator>
+__host__ __device__ constexpr typename bucket_storage<T, BucketSize, Extent, Allocator>::size_type
+bucket_storage<T, BucketSize, Extent, Allocator>::capacity() const noexcept
+{
+  return static_cast<size_type>(extent_);
+}
+
+template <typename T, int BucketSize, typename Extent, typename Allocator>
+__host__ __device__ constexpr typename bucket_storage<T, BucketSize, Extent, Allocator>::extent_type
+bucket_storage<T, BucketSize, Extent, Allocator>::extent() const noexcept
+{
+  return extent_;
+}
+
+}  // namespace cuco

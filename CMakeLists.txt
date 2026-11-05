@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.28)
-project(localization LANGUAGES C CXX)
+if (NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES native)
+endif ()
+project(localization LANGUAGES C CXX CUDA)
 
 if (NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
@@ -23,56 +26,62 @@ file(GLOB_RECURSE SOURCE_FILES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/sou
 
 find_package(Sophus REQUIRED)
 find_package(TBB REQUIRED)
+find_package(CUDAToolkit REQUIRED)
+find_package(CCCL REQUIRED CONFIG HINTS
+    "${CUDAToolkit_LIBRARY_ROOT}/lib64/cmake/cccl"
+    "${CUDAToolkit_LIBRARY_ROOT}/targets/${CMAKE_SYSTEM_PROCESSOR}-linux/lib/cmake/cccl"
+)
+find_package(PCL REQUIRED COMPONENTS common)
+
+include(FetchContent)
+FetchContent_Declare(cuco_headers
+    GIT_REPOSITORY https://github.com/NVIDIA/cuCollections.git
+    # Includes the CCCL 3 / CUDA 13 compatibility fix for thrust::identity.
+    GIT_TAG 7b422c00f3541e2472e8d1047b7c3bb4e83c7e2c
+    # Only use the headers; CCCL is supplied by the CUDA toolkit.
+    SOURCE_SUBDIR include
+)
+FetchContent_MakeAvailable(cuco_headers)
+
+add_library(sparse_voxel STATIC source/types/SparseVoxel.cu)
+target_include_directories(sparse_voxel PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+)
+target_include_directories(sparse_voxel SYSTEM PUBLIC ${PCL_INCLUDE_DIRS})
+target_include_directories(sparse_voxel SYSTEM PRIVATE ${cuco_headers_SOURCE_DIR}/include)
+target_link_libraries(sparse_voxel PUBLIC pcl_common CUDA::cudart CCCL::CCCL)
+target_compile_features(sparse_voxel PUBLIC cxx_std_20 PRIVATE cuda_std_20)
+target_compile_options(sparse_voxel PRIVATE --expt-relaxed-constexpr --extended-lambda --fmad=false)
+set_target_properties(sparse_voxel PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+add_library(gicp STATIC source/GICP/GICP.cu)
+target_link_libraries(gicp PUBLIC sparse_voxel Sophus::Sophus)
+target_compile_features(gicp PRIVATE cuda_std_20)
+target_compile_options(gicp PRIVATE --expt-relaxed-constexpr --extended-lambda --fmad=false)
+set_target_properties(gicp PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
 ament_auto_add_executable(localization ${SOURCE_FILES})
 target_include_directories(localization PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include/${PROJECT_NAME}>
 )
-target_link_libraries(localization Sophus::Sophus TBB::tbb)
+target_link_libraries(localization Sophus::Sophus TBB::tbb gicp)
 target_compile_features(localization PUBLIC c_std_99 cxx_std_23)
 
 if (BUILD_TESTING)
-    add_executable(ieskf_regression
-        tests/ieskf_regression.cpp
-        source/types/iVox.cpp
-    )
-    ament_target_dependencies(ieskf_regression SYSTEM ${${PROJECT_NAME}_FOUND_BUILD_DEPENDS})
-    target_include_directories(ieskf_regression PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    target_link_libraries(ieskf_regression Sophus::Sophus TBB::tbb)
-    target_compile_features(ieskf_regression PRIVATE cxx_std_23)
-    add_test(NAME ieskf_regression COMMAND ieskf_regression)
+    add_executable(sparse_voxel_device_test tests/sparse_voxel_device_test.cu)
+    target_link_libraries(sparse_voxel_device_test PRIVATE sparse_voxel)
+    target_compile_features(sparse_voxel_device_test PRIVATE cuda_std_20)
+    target_compile_options(sparse_voxel_device_test PRIVATE --expt-relaxed-constexpr --extended-lambda --fmad=false)
+    set_target_properties(sparse_voxel_device_test PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+    add_test(NAME sparse_voxel_device_test COMMAND sparse_voxel_device_test)
 
-    find_package(PCL REQUIRED COMPONENTS registration)
-    add_executable(gicp_benchmark
-        tests/gicp_benchmark.cpp
-        source/GICP/GICP.cpp
-        source/types/SparseVoxel.cpp
-    )
-    ament_target_dependencies(gicp_benchmark SYSTEM ${${PROJECT_NAME}_FOUND_BUILD_DEPENDS})
-    target_include_directories(gicp_benchmark PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    target_link_libraries(gicp_benchmark Sophus::Sophus TBB::tbb pcl_registration)
-    target_compile_features(gicp_benchmark PRIVATE cxx_std_23)
-    add_test(NAME gicp_benchmark_smoke COMMAND gicp_benchmark --quick --repeats 1 --threads 2)
-
-    add_executable(sparse_voxel_search
-        tests/sparse_voxel_search.cpp
-        source/types/SparseVoxel.cpp
-    )
-    ament_target_dependencies(sparse_voxel_search SYSTEM ${${PROJECT_NAME}_FOUND_BUILD_DEPENDS})
-    target_include_directories(sparse_voxel_search PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    target_link_libraries(sparse_voxel_search TBB::tbb pcl_search)
-    target_compile_features(sparse_voxel_search PRIVATE cxx_std_23)
-    add_test(NAME sparse_voxel_search COMMAND sparse_voxel_search)
-
-#    add_executable(incremental_voxel_test
-#        test/incremental_voxel_test.cpp
-#        source/LIO/SparseVoxel.cpp
-#    )
-#    target_include_directories(incremental_voxel_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-#    ament_target_dependencies(incremental_voxel_test pcl_ros)
-#    target_compile_features(incremental_voxel_test PRIVATE cxx_std_23)
-#    add_test(NAME incremental_voxel_test COMMAND incremental_voxel_test)
+    find_package(PCL REQUIRED COMPONENTS filters)
+    find_package(Threads REQUIRED)
+    add_executable(gpu_resident_regression tests/gpu_resident_regression.cpp)
+    target_link_libraries(gpu_resident_regression PRIVATE gicp pcl_filters Threads::Threads)
+    target_compile_features(gpu_resident_regression PRIVATE cxx_std_23)
+    add_test(NAME gpu_resident_regression COMMAND gpu_resident_regression)
 
     find_package(ament_lint_auto REQUIRED)
     set(ament_cmake_copyright_FOUND TRUE)

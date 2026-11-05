@@ -1,8 +1,9 @@
 #include "localization/nodes/Localization_LO.h"
 #include <pcl_conversions/pcl_conversions.h>
-#include "localization/tools/OrthographicProjector.hpp"
-#include "localization/tools/feature_detect_3d.hpp"
-#include <opencv2/opencv.hpp>
+#include <algorithm>
+#include <cmath>
+#include <numeric>
+#include <optional>
 
 namespace
 {
@@ -61,25 +62,6 @@ std::optional<IntensityAnalysis> analyzeIntensity(const pcl::PointCloud<pcl::Poi
 }
 }
 
-void Localization_LO::updateVoxelMap(const pcl::PointCloud<pcl::PointXYZ>& scan_in_base_link)
-{
-    // Transform scan into trailer local template frame
-    pcl::PointCloud<pcl::PointXYZ> scan_in_map;
-    pcl::transformPointCloud(scan_in_base_link, scan_in_map, mBasePose.cast<float>());
-
-    *mCloudMap += scan_in_map;   // Merge into voxel map
-
-    const auto filtered_map = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
-    pcl::VoxelGrid<pcl::PointXYZ> voxel_filter;
-    voxel_filter.setLeafSize(MAP_RESOLUTION, MAP_RESOLUTION, MAP_RESOLUTION);
-    voxel_filter.setInputCloud(mCloudMap);
-    voxel_filter.filter(*filtered_map);
-
-    mCloudMap = filtered_map;
-
-    mGicp.insertTargetPoints(scan_in_map);
-}
-
 void Localization_LO::recordGicpDuration(const double duration_ms)
 {
     if (constexpr std::size_t statistics_window_size = 200;
@@ -107,77 +89,8 @@ void Localization_LO::recordGicpDuration(const double duration_ms)
                         static_cast<double>(mGicpDurationsMs.size());
 
     RCLCPP_INFO(get_logger(),
-                "Sparse GICP latency (%zu-frame window): mean %.2f ms, P50 %.2f ms, P95 %.2f ms, P99 %.2f ms, max %.2f ms",
+                "CUDA scan pipeline latency (%zu-frame window): mean %.2f ms, P50 %.2f ms, P95 %.2f ms, P99 %.2f ms, max %.2f ms",
                 mGicpDurationsMs.size(), mean, percentile(0.50), percentile(0.95), percentile(0.99), sorted_durations.back());
-}
-
-bool Localization_LO::alignICP(const pcl::PointCloud<pcl::PointXYZ>::Ptr& current_scan)
-{
-    // RCLCPP_INFO(get_logger(), "Sparsity-aware GICP start.");
-    if (mCloudMap == nullptr || mCloudMap->empty() || current_scan == nullptr || current_scan->empty())
-    {
-        const std::size_t target_point_count = mCloudMap == nullptr ? 0 : mCloudMap->size();
-        const std::size_t source_point_count = current_scan == nullptr ? 0 : current_scan->size();
-        RCLCPP_WARN(get_logger(), "GICP skipped: target map has %zu points; source ROI has %zu points.",
-                    target_point_count, source_point_count);
-        return false;
-    }
-
-    const auto start_time = std::chrono::high_resolution_clock::now();
-    GICP::Result result;
-    try
-    {
-        result = mGicp.align(*current_scan, mBasePose);
-    }
-    catch (const std::exception& exception)
-    {
-        RCLCPP_ERROR(get_logger(), "Sparse GICP failed: %s", exception.what());
-        return false;
-    }
-
-    const auto end_time = std::chrono::high_resolution_clock::now();
-    const double duration_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
-
-    if constexpr (PRINT_BENCHMARK)
-    {
-        RCLCPP_INFO(get_logger(), "Sparse GICP computation time: %.2f ms", duration_ms);
-        recordGicpDuration(duration_ms);
-    }
-
-
-    if (result.converged)
-    {
-        const double fitness_score = result.fitness_score;
-        const auto& gicp_config = mGicp.config();
-        if constexpr (PRINT_BENCHMARK)
-        {
-            RCLCPP_INFO(get_logger(), "Sparse GICP fitness score: %.4f, iter: %d, correspondences: %zu/%zu",
-                    fitness_score, result.iterations, result.num_correspondences, result.num_source_points);
-        }
-
-        if (result.num_correspondences < gicp_config.min_correspondences)
-        {
-            RCLCPP_WARN(get_logger(), "GICP converged with too few correspondences (%zu < %zu), skipping map update.",
-                        result.num_correspondences, gicp_config.min_correspondences);
-            return false;
-        }
-
-        mBasePose = result.transform;
-
-        if (fitness_score > gicp_config.max_fitness_score)
-        {
-            RCLCPP_WARN(get_logger(), "GICP converged but fitness score (%.4f) > threshold (%.4f), skipping map update.",
-                        fitness_score, gicp_config.max_fitness_score);
-            return false;
-        }
-
-        return true;
-    }
-
-    RCLCPP_WARN(get_logger(), "Sparse GICP did not converge: iter: %d, correspondences: %zu/%zu, fitness: %.6f.",
-                result.iterations, result.num_correspondences, result.num_source_points,
-                result.fitness_score);
-    return false;
 }
 
 void Localization_LO::workerLoop()
@@ -202,7 +115,7 @@ void Localization_LO::workerLoop()
         pcl::PointCloud<pcl::PointXYZI> lidar_points;
         pcl::fromROSMsg(*scan_msg, lidar_points);
 
-        pcl::transformPointCloud(lidar_points, lidar_points, T_truck2lidar);
+        // pcl::transformPointCloud(lidar_points, lidar_points, T_truck2lidar);
 
         if (!mIntensityAnalyzed)
         {
@@ -235,68 +148,79 @@ void Localization_LO::workerLoop()
             }
         }
 
-        /* Filter out points below the selected intensity threshold */
-        const auto denoised_scan = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
-        denoised_scan->reserve(lidar_points.size());
-        for (const auto& point : lidar_points)
+        const bool initializing = !mMapInitialized;
+        const bool publish_scan = !initializing && (mProcessedScanVisPub->get_subscription_count() != 0 ||
+                                                   mProcessedScanVisPub->get_intra_process_subscription_count() != 0);
+        const bool publish_map = !initializing && (mVoxelMapPub->get_subscription_count() != 0 ||
+                                                  mVoxelMapPub->get_intra_process_subscription_count() != 0);
+        GICP::PreprocessConfig preprocessing;
+        preprocessing.voxel_size = MAP_RESOLUTION;
+        preprocessing.map_voxel_size = MAP_RESOLUTION * 2.0f;
+        preprocessing.intensity_threshold = mIntensityThreshold;
+        preprocessing.footprint_x = 1.8f;
+        preprocessing.footprint_y = 0.8f;
+        const auto pipeline_start = std::chrono::steady_clock::now();
+        GICP::FrameResult frame;
+        try
         {
-            if (point.intensity < mIntensityThreshold)
-            {
-                continue;
-            }
-
-            if (point.x > 1.8f || point.x < -1.8f || point.y > 0.8f || point.y < -0.8f)
-            {
-                denoised_scan->emplace_back(point.x, point.y, point.z);
-            }
+            frame = mGicp.processFrame(lidar_points, mBasePose, preprocessing, publish_scan, publish_map);
         }
-
-        /* Preprocess the cloud */
-        const auto processed_cloud = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
-        pcl::VoxelGrid<pcl::PointXYZ> voxel_filter;
-        voxel_filter.setLeafSize(MAP_RESOLUTION, MAP_RESOLUTION, MAP_RESOLUTION);
-        voxel_filter.setInputCloud(denoised_scan);
-        voxel_filter.filter(*processed_cloud);
-
-        if (mCloudMap == nullptr)
+        catch (const std::exception& exception)
         {
-            if (processed_cloud->size() > 100)
-            {
-                mCloudMap = processed_cloud;
-                mGicp.insertTargetPoints(*mCloudMap);
-            }
-            else
-            {
-                RCLCPP_WARN(get_logger(), "processed_cloud is empty!");
-            }
+            RCLCPP_ERROR(get_logger(), "CUDA scan pipeline failed: %s", exception.what());
             continue;
         }
-
-        if (processed_cloud->empty())
+        if (frame.num_invalid_points != 0)
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "GPU filtering rejected %zu nonfinite points.",
+                                frame.num_invalid_points);
+        mMapInitialized = frame.initialized;
+        if (initializing)
         {
-            RCLCPP_WARN(get_logger(), "Skipping GICP: current scan has no points inside the trailer ROI.");
+            if (!mMapInitialized) RCLCPP_WARN(get_logger(), "GPU preprocessing retained too few points to initialize the map.");
             continue;
         }
-
-        if (alignICP(processed_cloud))
+        if (frame.num_processed_points == 0)
         {
-            updateVoxelMap(*processed_cloud);
+            RCLCPP_WARN(get_logger(), "Skipping GICP: GPU filtering retained no scan points.");
+            continue;
         }
-
-        pcl::PointCloud<pcl::PointXYZ> transformed_scan;
-        pcl::transformPointCloud(*processed_cloud, transformed_scan, mBasePose.cast<float>());
-
-        sensor_msgs::msg::PointCloud2 scan_vis_msg;
-        pcl::toROSMsg(transformed_scan, scan_vis_msg);
-        scan_vis_msg.header.stamp = this->now();
-        scan_vis_msg.header.frame_id = "map";
-        mProcessedScanVisPub->publish(scan_vis_msg);
-
-        sensor_msgs::msg::PointCloud2 map_msg;
-        pcl::toROSMsg(*mCloudMap, map_msg);
-        map_msg.header.stamp = this->now();
-        map_msg.header.frame_id = "map";
-        mVoxelMapPub->publish(map_msg);
+        const GICP::Result& result = frame.registration;
+        const auto& config = mGicp.config();
+        if (result.converged && result.num_correspondences >= config.min_correspondences)
+        {
+            mBasePose = result.transform;
+            if (result.fitness_score > config.max_fitness_score)
+                RCLCPP_WARN(get_logger(), "GICP fitness %.4f > %.4f; GPU map update skipped.",
+                            result.fitness_score, config.max_fitness_score);
+        }
+        else
+            RCLCPP_WARN(get_logger(), "GICP rejected: iterations %d, correspondences %zu/%zu, fitness %.6f.",
+                        result.iterations, result.num_correspondences, result.num_source_points, result.fitness_score);
+        if constexpr (PRINT_BENCHMARK)
+        {
+            const double duration_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - pipeline_start).count();
+            RCLCPP_INFO(get_logger(), "CUDA scan pipeline: %.2f ms, iterations %d, correspondences %zu/%zu, fitness %.6f.",
+                        duration_ms, result.iterations, result.num_correspondences, result.num_source_points,
+                        result.fitness_score);
+            recordGicpDuration(duration_ms);
+        }
+        if (publish_scan)
+        {
+            sensor_msgs::msg::PointCloud2 scan_vis_msg;
+            pcl::toROSMsg(frame.scan_in_map, scan_vis_msg);
+            scan_vis_msg.header.stamp = this->now();
+            scan_vis_msg.header.frame_id = "map";
+            mProcessedScanVisPub->publish(scan_vis_msg);
+        }
+        if (publish_map)
+        {
+            sensor_msgs::msg::PointCloud2 map_msg;
+            pcl::toROSMsg(frame.map, map_msg);
+            map_msg.header.stamp = this->now();
+            map_msg.header.frame_id = "map";
+            mVoxelMapPub->publish(map_msg);
+        }
 
         geometry_msgs::msg::PoseStamped pose_msg;
         pose_msg.header = scan_msg->header;
