@@ -60,7 +60,7 @@ public:
         mConfig = config;
     }
 
-    void insertTargetPoints(const pcl::PointCloud<pcl::PointXYZ>& points);
+    void insertTargetPoints(const pcl::PointCloud<pcl::PointXYZ>& points) const;
 
     Result align(const pcl::PointCloud<pcl::PointXYZ>& source, const Eigen::Isometry3d& initial_guess) const;
 

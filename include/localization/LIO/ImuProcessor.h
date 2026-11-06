@@ -1,7 +1,7 @@
 #pragma once
 #include <sophus/se3.hpp>
 #include "localization/types/nav_state.hpp"
-#include "localization/types/deskew.hpp"
+#include "localization/types/stamped_cloud.hpp"
 #include <algorithm>
 #include <cmath>
 #include <memory>

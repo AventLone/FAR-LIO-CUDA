@@ -6,7 +6,27 @@
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <rclcpp/time.hpp>
-#include "localization/types/deskew.hpp"
+
+
+struct PointXYZIT
+{
+    Eigen::Vector3f position;
+    float intensity;
+    double time_offset;   // Seconds relative to scan begin.
+};
+
+struct StampedCloud
+{
+    double begin_time, end_time;   // Scan timestamps in seconds.
+    std::vector<PointXYZIT> points;
+};
+
+struct TimedPose
+{
+    double timestamp{0.0};   // Same clock and seconds as StampedCloud.
+    Eigen::Quaterniond rotation{Eigen::Quaterniond::Identity()};
+    Eigen::Vector3d translation{Eigen::Vector3d::Zero()};
+};
 
 // static bool parseCloudMsg(const sensor_msgs::msg::PointCloud2& msg, StampedCloud& cloud)
 // {
