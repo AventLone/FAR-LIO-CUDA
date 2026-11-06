@@ -62,6 +62,9 @@ covariance weighting and double-precision normal equations. Only a 240-byte
 aggregate is returned per iteration; Eigen's CPU LDLT and Sophus perform the
 small solve and left pose update. There is no separate correspondence buffer or
 CPU nearest-neighbor search.
+Pose and equation fields use fixed-size Eigen matrices/vectors. The symmetric
+Hessian retains its 21-element lower-triangle layout; equation vectors use
+`Eigen::DontAlign` to keep the reduction aggregate packed at 240 bytes.
 
 The original covariance fallback, strict distance gate and iteration semantics
 are preserved. `converged` retains the legacy meaning of at least one finite

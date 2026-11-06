@@ -43,8 +43,8 @@ public:
     static constexpr int MAX_COVARIANCE_NEIGHBORS = 12;
 
     // Allocate with new/make_unique so the object itself is GPU-accessible.
-    static void* operator new(std::size_t size);
-    static void operator delete(void* pointer) noexcept;
+    void* operator new(std::size_t size);
+    void operator delete(void* pointer) noexcept;
     SparseVoxel();
     ~SparseVoxel();
     SparseVoxel(const SparseVoxel&) = delete;

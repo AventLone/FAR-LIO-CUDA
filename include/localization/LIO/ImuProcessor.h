@@ -71,7 +71,10 @@ public:
         return result;
     }
 
-    const Sophus::SE3d& extrinsic() const noexcept { return mT_il; }
+    const Sophus::SE3d& extrinsic() const noexcept
+    {
+        return mT_il;
+    }
 
 private:
     struct PoseState

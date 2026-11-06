@@ -29,7 +29,9 @@ void check(const cudaError_t error, const char* operation)
 void report(cudaError_t error, const char* operation)
 {
     if (error != cudaSuccess)
+    {
         std::fprintf(stderr, "%s: %s\n", operation, cudaGetErrorString(error));
+    }
 }
 }
 
@@ -38,7 +40,7 @@ struct alignas(8) SparseVoxel::VoxelKey
     std::int16_t x, y, z, padding{0};
 
     __host__ __device__ VoxelKey() = default;
-    __host__ __device__ VoxelKey(std::int16_t x, std::int16_t y, std::int16_t z, std::int16_t padding = 0)
+    __host__ __device__ VoxelKey(const std::int16_t x, const std::int16_t y, const std::int16_t z, const std::int16_t padding = 0)
         : x(x), y(y), z(z), padding(padding)
     {
     }
@@ -50,8 +52,14 @@ struct alignas(8) SparseVoxel::VoxelKey
 
     __host__ __device__ bool operator<(const VoxelKey& rhs) const noexcept
     {
-        if (x != rhs.x) return x < rhs.x;
-        if (y != rhs.y) return y < rhs.y;
+        if (x != rhs.x)
+        {
+            return x < rhs.x;
+        }
+        if (y != rhs.y)
+        {
+            return y < rhs.y;
+        }
         return z < rhs.z;
     }
 };
@@ -65,9 +73,18 @@ struct SparseVoxel::VoxelCell
 
     __device__ void add(const Eigen::Vector3f& position)
     {
-        if (count == CAPACITY) return;
+        if (count == CAPACITY)
+        {
+            return;
+        }
+
         for (int i = 0; i < count; ++i)
-            if ((points[i].position - position).squaredNorm() < MIN_DIST * MIN_DIST) return;
+        {
+            if ((points[i].position - position).squaredNorm() < MIN_DIST * MIN_DIST)
+            {
+                return;
+            }
+        }
 
         auto& point = points[count++];
         point.position = position;
@@ -80,7 +97,8 @@ struct SparseVoxel::Storage
 {
     struct Hash
     {
-        __host__ __device__ std::uint32_t operator()(const VoxelKey& key) const noexcept
+        __host__ __device__
+        std::uint32_t operator()(const VoxelKey& key) const noexcept
         {
             return (static_cast<std::uint32_t>(key.x) * 73856093u) ^
                    (static_cast<std::uint32_t>(key.y) * 19349669u) ^
@@ -149,29 +167,43 @@ __device__ SparseVoxel::VoxelCell* SparseVoxel::findCell(const VoxelKey& key) co
     return found == index.end() ? nullptr : found->second;
 }
 
-__device__ int SparseVoxel::nearestNeighbors(const Eigen::Vector3f& query, int max_neighbors,
-                                             Neighbor* output) const
+__device__ int SparseVoxel::nearestNeighbors(const Eigen::Vector3f& query, const int max_neighbors, Neighbor* output) const
 {
     if (max_neighbors == 0 || empty()) return 0;
     const VoxelKey center = voxelKey(query);
     int count = 0;
+
+    #pragma unroll
     for (int dx = -1; dx <= 1; ++dx)
+    {
+        #pragma unroll
         for (int dy = -1; dy <= 1; ++dy)
+        {
+            #pragma unroll
             for (int dz = -1; dz <= 1; ++dz)
             {
                 const int x = center.x + dx, y = center.y + dy, z = center.z + dz;
                 if (x < -32768 || x > 32767 || y < -32768 || y > 32767 || z < -32768 || z > 32767)
+                {
                     continue;
+                }
                 const VoxelCell* cell = findCell({static_cast<std::int16_t>(x),
-                                                static_cast<std::int16_t>(y),
-                                                static_cast<std::int16_t>(z)});
-                if (!cell) continue;
+                                                  static_cast<std::int16_t>(y),
+                                                  static_cast<std::int16_t>(z)});
+                if (cell == nullptr)
+                {
+                    continue;
+                }
+
                 for (int i = 0; i < cell->count; ++i)
                 {
                     const auto* point = &cell->points[i];
                     const Eigen::Vector3f delta = point->position - query;
                     const float distance = delta.squaredNorm();
-                    if (count == max_neighbors && distance >= output[count - 1].squared_distance) continue;
+                    if (count == max_neighbors && distance >= output[count - 1].squared_distance)
+                    {
+                        continue;
+                    }
                     int at = count < max_neighbors ? count++ : count - 1;
                     while (at > 0 && distance < output[at - 1].squared_distance)
                     {
@@ -181,15 +213,18 @@ __device__ int SparseVoxel::nearestNeighbors(const Eigen::Vector3f& query, int m
                     output[at] = {point, distance};
                 }
             }
+        }
+    }
     return count;
 }
 
 __device__ SparseVoxel::Neighbor SparseVoxel::nearestNeighbor(const Eigen::Vector3f& query, const float max_distance) const
 {
     Neighbor result;
-    if (nearestNeighbors(query, 1, &result) == 0 ||
-        result.squared_distance >= max_distance * max_distance)
+    if (nearestNeighbors(query, 1, &result) == 0 || result.squared_distance >= max_distance * max_distance)
+    {
         return {};
+    }
     return result;
 }
 
@@ -199,10 +234,16 @@ __device__ bool SparseVoxel::estimateCovariance(PointWithCovariance& point) cons
     const int count = nearestNeighbors(point.position, MAX_COVARIANCE_NEIGHBORS, neighbors);
     point.covariance.setIdentity();
     point.covariance_valid = 0;
-    if (count < MIN_COVARIANCE_NEIGHBORS) return true;
+    if (count < MIN_COVARIANCE_NEIGHBORS)
+    {
+        return true;
+    }
 
     Eigen::Vector3f mean = Eigen::Vector3f::Zero();
-    for (int i = 0; i < count; ++i) mean += neighbors[i].point->position;
+    for (int i = 0; i < count; ++i)
+    {
+        mean += neighbors[i].point->position;
+    }
     mean /= static_cast<float>(count);
     CovarianceMatrix covariance = CovarianceMatrix::Zero();
     for (int i = 0; i < count; ++i)
@@ -214,7 +255,7 @@ __device__ bool SparseVoxel::estimateCovariance(PointWithCovariance& point) cons
     covariance.diagonal().array() += 1e-6f;
     const CovarianceMatrix inverse = covariance.inverse();
     covariance *= inverse.norm();
-    // if (!covariance.allFinite()) return false;
+
     point.covariance = covariance;
     point.covariance_valid = 1;
     return true;
@@ -222,17 +263,21 @@ __device__ bool SparseVoxel::estimateCovariance(PointWithCovariance& point) cons
 
 bool SparseVoxel::insert(const pcl::PointCloud<pcl::PointXYZ>& cloud)
 {
-    if (cloud.empty()) return false;
-    thrust::device_vector<pcl::PointXYZ> input(cloud.begin(), cloud.end());
-    const bool valid = thrust::transform_reduce(input.begin(), input.end(),
-        [] __device__(const pcl::PointXYZ& point) -> bool
+    if (cloud.empty())
     {
-        return isfinite(point.x) && isfinite(point.y) && isfinite(point.z) &&
-               point.x >= -16384.0f && point.x < 16384.0f &&
+        return false;
+    }
+    thrust::device_vector<pcl::PointXYZ> input(cloud.begin(), cloud.end());
+    const bool valid = thrust::transform_reduce(input.begin(), input.end(), [] __device__(const pcl::PointXYZ& point) -> bool
+    {
+        return point.x >= -16384.0f && point.x < 16384.0f &&
                point.y >= -16384.0f && point.y < 16384.0f &&
                point.z >= -16384.0f && point.z < 16384.0f;
     }, true, thrust::logical_and<bool>{});
-    if (!valid) throw std::invalid_argument("SparseVoxel positions must be finite and in [-16384, 16384) m");
+    if (!valid)
+    {
+        throw std::invalid_argument("SparseVoxel positions must be finite and in [-16384, 16384) m");
+    }
 
     const std::size_t size = input.size();
     thrust::device_vector<VoxelKey> keys(size);
@@ -246,17 +291,23 @@ bool SparseVoxel::insert(const pcl::PointCloud<pcl::PointXYZ>& cloud)
 
     const auto first = thrust::make_counting_iterator<std::size_t>(0);
     const auto* key_data = keys.data().get();
-    const auto groups_end = thrust::copy_if(thrust::device, first, first + size, starts.begin(),
-        [=] __device__(std::size_t i) { return i == 0 || !(key_data[i] == key_data[i - 1]); });
+    const auto groups_end = thrust::copy_if(thrust::device, first, first + size, starts.begin(), [=] __device__(std::size_t i)
+                    {
+                        return i == 0 || !(key_data[i] == key_data[i - 1]);
+                    });
     const std::size_t groups = groups_end - starts.begin();
     starts[groups] = size;
     const auto* boundaries = starts.data().get();
     const auto find = mStorage->map.ref(cuco::find);
-    const auto new_end = thrust::copy_if(thrust::device, first, first + groups, new_groups.begin(),
-        [=] __device__(std::size_t i) { return find.find(key_data[boundaries[i]]) == find.end(); });
+    const auto new_end = thrust::copy_if(thrust::device, first, first + groups, new_groups.begin(), [=] __device__(const std::size_t i)
+        {
+            return find.find(key_data[boundaries[i]]) == find.end();
+        });
     const std::size_t new_count = new_end - new_groups.begin();
     if (mStorage->voxel_count + new_count > MAX_MAP_SIZE / 2)
+    {
         throw std::length_error("SparseVoxel hash table reached its voxel budget");
+    }
 
     const std::size_t previous_count = mPointCount;
     mStorage->points.resize(previous_count + size);
@@ -268,9 +319,9 @@ bool SparseVoxel::insert(const pcl::PointCloud<pcl::PointXYZ>& cloud)
         const auto* groups_data = new_groups.data().get();
         auto index = mStorage->map.ref(cuco::insert);
         thrust::for_each(thrust::device, first, first + new_count, [=] __device__(std::size_t i) mutable
-        {
-            index.insert(cuco::pair{key_data[boundaries[groups_data[i]]], cells + i});
-        });
+            {
+                index.insert(cuco::pair{key_data[boundaries[groups_data[i]]], cells + i});
+            });
         mStorage->voxel_count += new_count;
     }
 
@@ -292,12 +343,18 @@ bool SparseVoxel::insert(const pcl::PointCloud<pcl::PointXYZ>& cloud)
         if (added == 0) return;
         const auto offset = cuda::atomic_ref<std::size_t, cuda::thread_scope_device>{mPointCount}
                                 .fetch_add(added, cuda::memory_order_relaxed);
-        for (int i = 0; i < added; ++i) output[offset + i] = &cell->points[old_count + i];
+        for (int i = 0; i < added; ++i)
+        {
+            output[offset + i] = &cell->points[old_count + i];
+        }
 
+        #pragma unroll
         for (int dx = -1; dx <= 1; ++dx)
         {
+            #pragma unroll
             for (int dy = -1; dy <= 1; ++dy)
             {
+                #pragma unroll
                 for (int dz = -1; dz <= 1; ++dz)
                 {
                     const int x = key.x + dx, y = key.y + dy, z = key.z + dz;
@@ -318,11 +375,13 @@ bool SparseVoxel::insert(const pcl::PointCloud<pcl::PointXYZ>& cloud)
     });
 
     thrust::for_each(thrust::device, first, first + previous_count + size,
-        [=, this] __device__(std::size_t i)
+        [=, this] __device__(const std::size_t i)
         {
             if (i >= mPointCount) return;
-            auto* point = output[i];
-            if (findCell(voxelKey(point->position))->covariance_epoch == epoch) estimateCovariance(*point);
+            if (auto* point = output[i]; findCell(voxelKey(point->position))->covariance_epoch == epoch)
+            {
+                estimateCovariance(*point);
+            }
         });
     check(cudaDeviceSynchronize(), "insert SparseVoxel points");
     mStorage->points.resize(mPointCount);

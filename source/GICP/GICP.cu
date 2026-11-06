@@ -1,9 +1,7 @@
 #include "localization/GICP/GICP.h"
-#include <algorithm>
 #include <stdexcept>
 #include <string>
 #include <Eigen/Cholesky>
-#include <Eigen/LU>
 #include <thrust/device_vector.h>
 #include <thrust/execution_policy.h>
 #include <thrust/iterator/counting_iterator.h>
@@ -21,14 +19,14 @@ void check(const cudaError_t error, const char* operation)
 
 struct Pose
 {
-    double rotation[9];
-    double translation[3];
+    Eigen::Matrix3d rotation;
+    Eigen::Vector3d translation;
 };
 
 struct Equation
 {
-    double hessian[21]{};
-    double gradient[6]{};
+    Eigen::Matrix<double, 21, 1, Eigen::DontAlign> hessian = Eigen::Matrix<double, 21, 1>::Zero();
+    Eigen::Matrix<double, 6, 1, Eigen::DontAlign> gradient = Eigen::Matrix<double, 6, 1>::Zero();
     double squared_error{0.0};
     std::size_t count{0};
     std::size_t error{0};
@@ -36,10 +34,11 @@ struct Equation
 
 struct Sum
 {
-    __host__ __device__ Equation operator()(Equation lhs, const Equation& rhs) const
+    __host__ __device__
+    Equation operator()(Equation lhs, const Equation& rhs) const
     {
-        for (int i = 0; i < 21; ++i) lhs.hessian[i] += rhs.hessian[i];
-        for (int i = 0; i < 6; ++i) lhs.gradient[i] += rhs.gradient[i];
+        lhs.hessian += rhs.hessian;
+        lhs.gradient += rhs.gradient;
         lhs.squared_error += rhs.squared_error;
         lhs.count += rhs.count;
         lhs.error |= rhs.error;
@@ -53,30 +52,41 @@ __global__ void countPoints(const SparseVoxel* source, const SparseVoxel* target
     counts[1] = target->points().size();
 }
 
-__device__ Equation contribute(const PointWithCovariance& source, const SparseVoxel* target,
-                               const Pose& pose, const float max_distance)
+__device__
+Equation contribute(const PointWithCovariance& source, const SparseVoxel* target, const Pose& pose, const float max_distance)
 {
     Equation equation;
-    const Eigen::Matrix3d rotation = Eigen::Map<const Eigen::Matrix3d>(pose.rotation);
-    const Eigen::Vector3d position = rotation * source.position.cast<double>() +
-                                    Eigen::Map<const Eigen::Vector3d>(pose.translation);
+    const Eigen::Vector3d position = pose.rotation * source.position.cast<double>() + pose.translation;
     const Eigen::Vector3f query = position.cast<float>();
+
+    #pragma unroll
     for (int axis = 0; axis < 3; ++axis)
+    {
         if (!(query[axis] >= -16384.0f && query[axis] < 16384.0f))
         {
             equation.error = 1;
             return equation;
         }
+    }
+
     const auto [point, squared_distance] = target->nearestNeighbor(query, max_distance);
-    if (!point) return equation;
+    if (!point)
+    {
+        return equation;
+    }
 
     Eigen::Matrix3d covariance = Eigen::Matrix3d::Identity();
     if (source.covariance_valid)
     {
-        if (point->covariance_valid) covariance = point->covariance.cast<double>();
-        covariance.noalias() += rotation * source.covariance.cast<double>() * rotation.transpose();
+        if (point->covariance_valid)
+        {
+            covariance = point->covariance.cast<double>();
+        }
+        covariance.noalias() += pose.rotation * source.covariance.cast<double>() * pose.rotation.transpose();
     }
     const Eigen::Matrix3d precision = covariance.inverse();
+
+    #pragma unroll
     for (int i = 0; i < 9; ++i)
     {
         if (!isfinite(precision.data()[i]))
@@ -91,12 +101,17 @@ __device__ Equation contribute(const PointWithCovariance& source, const SparseVo
     jacobian.leftCols<3>().setIdentity();
     jacobian.rightCols<3>() = -Sophus::SO3d::hat(position);
     const Eigen::Matrix<double, 6, 6> hessian = jacobian.transpose() * precision * jacobian;
-    const Eigen::Matrix<double, 6, 1> gradient = jacobian.transpose() * precision * residual;
+    equation.gradient.noalias() = jacobian.transpose() * precision * residual;
     int index = 0;
+
+    #pragma unroll
     for (int row = 0; row < 6; ++row)
     {
-        equation.gradient[row] = gradient[row];
-        for (int col = 0; col <= row; ++col) equation.hessian[index++] = hessian(row, col);
+        #pragma unroll
+        for (int col = 0; col <= row; ++col)
+        {
+            equation.hessian[index++] = hessian(row, col);
+        }
     }
     equation.squared_error = residual.squaredNorm();
     equation.count = 1;
@@ -143,15 +158,13 @@ GICP::Result GICP::align(const pcl::PointCloud<pcl::PointXYZ>& source, const Eig
     const float max_distance = mConfig.max_correspondence_distance;
     for (int iteration = 0; iteration < mConfig.max_iterations; ++iteration)
     {
-        Pose device_pose{};
-        const Eigen::Matrix3d rotation = pose.rotationMatrix();
-        std::copy_n(rotation.data(), 9, device_pose.rotation);
-        std::copy_n(pose.translation().data(), 3, device_pose.translation);
+        const Pose device_pose{pose.rotationMatrix(), pose.translation()};
         const Equation equation = thrust::transform_reduce(thrust::device, first, first + sizes[0],
             [=] __device__(const std::size_t i) -> Equation
             {
                 return contribute(*source_pointer->points()[i], target_pointer, device_pose, max_distance);
             }, Equation{}, Sum{});
+
         if (equation.error || !std::isfinite(equation.squared_error))
         {
             throw std::runtime_error("GICP encountered invalid query coordinates or covariance");
@@ -162,11 +175,10 @@ GICP::Result GICP::align(const pcl::PointCloud<pcl::PointXYZ>& source, const Eig
         }
 
         Eigen::Matrix<double, 6, 6> hessian;
-        Eigen::Matrix<double, 6, 1> rhs;
+        const Eigen::Vector<double, 6> rhs = -equation.gradient;
         int index = 0;
         for (int row = 0; row < 6; ++row)
         {
-            rhs[row] = -equation.gradient[row];
             for (int col = 0; col <= row; ++col)
             {
                 hessian(row, col) = hessian(col, row) = equation.hessian[index++];

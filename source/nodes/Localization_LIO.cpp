@@ -69,6 +69,8 @@ void Localization_LIO::updateVoxelMap(const pcl::PointCloud<pcl::PointXYZ>& scan
     pcl::PointCloud<pcl::PointXYZ> scan_in_trailer;
     pcl::transformPointCloud(scan, scan_in_trailer, mESKF.pose().cast<float>());
 
+    mGicp.insertTargetPoints(scan_in_trailer);
+
     *mMap += scan_in_trailer;   // Merge into voxel map
 
     const auto filtered_map = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
@@ -78,7 +80,6 @@ void Localization_LIO::updateVoxelMap(const pcl::PointCloud<pcl::PointXYZ>& scan
     voxel_filter.filter(*filtered_map);
 
     mMap = filtered_map;
-    mGicp.insertTargetPoints(scan_in_trailer);
 }
 
 pcl::PointCloud<pcl::PointXYZ>::Ptr Localization_LIO::denoiseAndDownsample(const pcl::PointCloud<pcl::PointXYZI>& src) const
