@@ -9,6 +9,8 @@
 #include <tf2_eigen/tf2_eigen.hpp>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
+#include <pcl/common/transforms.h>
+#include <pcl/filters/voxel_grid.h>
 #include "localization/GICP/GICP.h"
 #include "localization/LIO/ESKF.h"
 #include "localization/LIO/ImuProcessor.h"
@@ -21,38 +23,38 @@ class Localization_LIO : public rclcpp::Node
 public:
     explicit Localization_LIO(const std::string& node_name) : Node(node_name), mTfBuffer(this->get_clock()), mTfListener(mTfBuffer)
     {
-        Sophus::SE3d T_il;
+        // Sophus::SE3d T_il;
         /* Lookup transform */
-        while (rclcpp::ok())
-        {
-            try
-            {
-                // const auto transform = tf2::transformToEigen(mTfBuffer.lookupTransform("LOLA", "JT128", tf2::TimePointZero));
-                const auto transform = tf2::transformToEigen(mTfBuffer.lookupTransform("imu", "PandarXT-32", tf2::TimePointZero));
-                T_il = Sophus::SE3d(transform.rotation(), transform.translation());
-                mT_il = transform.cast<float>();
-                break;
-            }
-            catch (const tf2::TransformException& ex)
-            {
-                RCLCPP_ERROR(this->get_logger(), "Could not transform fork to body: %s", ex.what());
-            }
-        }
+        // while (rclcpp::ok())
+        // {
+        //     try
+        //     {
+        //         // const auto transform = tf2::transformToEigen(mTfBuffer.lookupTransform("LOLA", "JT128", tf2::TimePointZero));
+        //         const auto transform = tf2::transformToEigen(mTfBuffer.lookupTransform("imu", "PandarXT-32", tf2::TimePointZero));
+        //         T_il = Sophus::SE3d(transform.rotation(), transform.translation());
+        //         mT_il = transform.cast<float>();
+        //         break;
+        //     }
+        //     catch (const tf2::TransformException& ex)
+        //     {
+        //         RCLCPP_ERROR(this->get_logger(), "Could not transform fork to body: %s", ex.what());
+        //     }
+        // }
 
-        // Eigen::Matrix3d R;
-        // R << 0.9989892,  0.0444870, -0.0064406,
-        //     -0.0446353,  0.9986885, -0.0250789,
-        //      0.0053164,  0.0253410,  0.9996647;
-        // Eigen::Quaterniond q(R);
-        // q.normalize();
-        // const Eigen::Vector3d t{0.010965, -0.086864, 0.060426};
-        //
-        // Sophus::SE3d T_il(q, t);
+        Eigen::Matrix3d R;
+        R << 0.9989892,  0.0444870, -0.0064406,
+            -0.0446353,  0.9986885, -0.0250789,
+             0.0053164,  0.0253410,  0.9996647;
+        Eigen::Quaterniond q(R);
+        q.normalize();
+        const Eigen::Vector3d t{0.010965, -0.086864, 0.060426};
 
-        // Eigen::Isometry3d T = Eigen::Isometry3d::Identity();
-        // T.linear() = q.toRotationMatrix();
-        // T.translation() = t;
-        // mT_il = T.cast<float>();
+        Sophus::SE3d T_il(q, t);
+
+        Eigen::Isometry3d T = Eigen::Isometry3d::Identity();
+        T.linear() = q.toRotationMatrix();
+        T.translation() = t;
+        mT_il = T.cast<float>();
 
         mImuProcessor = std::make_unique<lio::ImuProcessor>(T_il);
 
@@ -61,7 +63,7 @@ public:
         mGicp.setConfig(config);
 
         mIntensityThreshold = static_cast<float>(declare_parameter<double>("intensity_threshold", -1.0));
-        mIntensityKeepRatio = std::clamp(static_cast<float>(declare_parameter<double>("intensity_keep_ratio", 0.6)), 0.01f, 1.0f);
+        mIntensityKeepRatio = std::clamp(static_cast<float>(declare_parameter<double>("intensity_keep_ratio", 0.99)), 0.01f, 1.0f);
 
         initSubscribers();
         initPublisher();
@@ -109,6 +111,7 @@ private:
     Eigen::Isometry3f T_truck2lidar;
 
     /* Trailer voxel map and estimated pose */
+    pcl::PointCloud<pcl::PointXYZ>::Ptr mMap;
     nav_msgs::msg::Path mBasePosePath;
 
     /* LIO */
@@ -123,8 +126,8 @@ private:
     void initSubscribers()
     {
         // mLidarScanSub = create_subscription<sensor_msgs::msg::PointCloud2>("/iv_points", rclcpp::SensorDataQoS(),
-        mLidarScanSub = create_subscription<sensor_msgs::msg::PointCloud2>("/hesai/pandar", 10,
-        // mLidarScanSub = create_subscription<sensor_msgs::msg::PointCloud2>("/velodyne_points", 10,
+        // mLidarScanSub = create_subscription<sensor_msgs::msg::PointCloud2>("/hesai/pandar", 10,
+        mLidarScanSub = create_subscription<sensor_msgs::msg::PointCloud2>("/velodyne_points", 10,
             [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr scan_msg)
                 {
                     {
@@ -138,8 +141,8 @@ private:
                     mTrigger.notify_one();
                 });
 
-        mImuSub = create_subscription<sensor_msgs::msg::Imu>("/alphasense/imu", 100,
-        // mImuSub = create_subscription<sensor_msgs::msg::Imu>("/imu/data", 100,
+        // mImuSub = create_subscription<sensor_msgs::msg::Imu>("/alphasense/imu", 100,
+        mImuSub = create_subscription<sensor_msgs::msg::Imu>("/imu/data", 100,
             [this](const sensor_msgs::msg::Imu::ConstSharedPtr& msg)
                 {
                     const lio::ImuData imu{rclcpp::Time(msg->header.stamp).seconds(),
@@ -172,11 +175,12 @@ private:
     //     pcl::transformPointCloud(src_scan, dst_scan, T_truck2lidar);
     // }
 
-    GICP::PreprocessConfig preprocessing() const;
+    pcl::PointCloud<pcl::PointXYZ>::Ptr denoiseAndDownsample(const pcl::PointCloud<pcl::PointXYZI>& src) const;
+    pcl::PointCloud<pcl::PointXYZ>::Ptr denoiseAndDownsample(const StampedCloud& src) const;
 
-    bool alignScanToMap();
+    bool alignScanToMap(const pcl::PointCloud<pcl::PointXYZ>::Ptr& current_scan);
 
-    void updateVoxelMap();
+    void updateVoxelMap(const pcl::PointCloud<pcl::PointXYZ>& scan);
 
     void workerLoop();
 };

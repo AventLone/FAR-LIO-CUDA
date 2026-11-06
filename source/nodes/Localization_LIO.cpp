@@ -1,9 +1,8 @@
 #include "localization/nodes/Localization_LIO.h"
 #include <pcl_conversions/pcl_conversions.h>
-#include <algorithm>
-#include <cmath>
-#include <future>
-#include <optional>
+#include "localization/tools/OrthographicProjector.hpp"
+#include "localization/tools/feature_detect_3d.hpp"
+#include <opencv2/opencv.hpp>
 
 #include "localization/types/stamped_cloud.hpp"
 
@@ -64,34 +63,97 @@ std::optional<IntensityAnalysis> analyzeIntensity(const pcl::PointCloud<pcl::Poi
 }
 }
 
-void Localization_LIO::updateVoxelMap()
+void Localization_LIO::updateVoxelMap(const pcl::PointCloud<pcl::PointXYZ>& scan)
 {
-    mGicp.insertPreparedTarget(mESKF.pose());
+    // Transform scan into trailer local template frame
+    pcl::PointCloud<pcl::PointXYZ> scan_in_trailer;
+    pcl::transformPointCloud(scan, scan_in_trailer, mESKF.pose().cast<float>());
+
+    *mMap += scan_in_trailer;   // Merge into voxel map
+
+    const auto filtered_map = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+    pcl::VoxelGrid<pcl::PointXYZ> voxel_filter;
+    voxel_filter.setLeafSize(MAP_RESOLUTION * 2.0f, MAP_RESOLUTION * 2.0f, MAP_RESOLUTION * 2.0f);
+    voxel_filter.setInputCloud(mMap);
+    voxel_filter.filter(*filtered_map);
+
+    mMap = filtered_map;
+    mGicp.insertTargetPoints(scan_in_trailer);
 }
 
-GICP::PreprocessConfig Localization_LIO::preprocessing() const
+pcl::PointCloud<pcl::PointXYZ>::Ptr Localization_LIO::denoiseAndDownsample(const pcl::PointCloud<pcl::PointXYZI>& src) const
 {
-    GICP::PreprocessConfig config;
-    config.voxel_size = MAP_RESOLUTION;
-    config.map_voxel_size = MAP_RESOLUTION * 2.0f;
-    config.intensity_threshold = mIntensityThreshold;
-    config.footprint_x = config.footprint_y = 0.8f;
-    config.sensor_to_output = mT_il;
-    return config;
-}
-
-bool Localization_LIO::alignScanToMap()
-{
-    const GICP::Result result = mGicp.alignPrepared(mESKF.pose());
-    if (result.num_invalid_points != 0)
-        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "GPU filtering rejected %zu nonfinite points.",
-                            result.num_invalid_points);
-
-    if (result.num_source_points == 0)
+    /* Filter out points below the selected intensity threshold */
+    const auto denoised_scan = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+    denoised_scan->reserve(src.size());
+    for (const auto& point : src)
     {
-        RCLCPP_WARN(get_logger(), "GPU preprocessing retained no scan points.");
+        if (point.intensity < mIntensityThreshold)
+        {
+            continue;
+        }
+
+        if (point.x > 0.8f || point.x < -0.8f || point.y > 0.8f || point.y < -0.8f)
+        {
+            denoised_scan->emplace_back(point.x, point.y, point.z);
+        }
+    }
+
+    /* Preprocess the cloud */
+    const auto processed_cloud = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+    pcl::VoxelGrid<pcl::PointXYZ> voxel_filter;
+    voxel_filter.setLeafSize(MAP_RESOLUTION, MAP_RESOLUTION, MAP_RESOLUTION);
+    voxel_filter.setInputCloud(denoised_scan);
+    voxel_filter.filter(*processed_cloud);
+
+    pcl::transformPointCloud(*processed_cloud, *processed_cloud, mT_il);
+
+    return processed_cloud;
+}
+
+pcl::PointCloud<pcl::PointXYZ>::Ptr Localization_LIO::denoiseAndDownsample(const StampedCloud& src) const
+{
+    /* Filter out points below the selected intensity threshold */
+    const auto denoised_scan = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+
+    denoised_scan->reserve(src.points.size());
+    for (const auto& point : src.points)
+    {
+        if (point.intensity < mIntensityThreshold)
+        {
+            continue;
+        }
+
+        if (point.position.x() > 0.8f || point.position.x() < -0.8f || point.position.y() > 0.8f || point.position.y() < -0.8f)
+        {
+            denoised_scan->emplace_back(point.position.x(), point.position.y(), point.position.z());
+        }
+    }
+
+    /* Preprocess the cloud */
+    const auto processed_cloud = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+    pcl::VoxelGrid<pcl::PointXYZ> voxel_filter;
+    voxel_filter.setLeafSize(MAP_RESOLUTION, MAP_RESOLUTION, MAP_RESOLUTION);
+    voxel_filter.setInputCloud(denoised_scan);
+    voxel_filter.filter(*processed_cloud);
+
+    pcl::transformPointCloud(*processed_cloud, *processed_cloud, mT_il);
+    return processed_cloud;
+}
+
+bool Localization_LIO::alignScanToMap(const pcl::PointCloud<pcl::PointXYZ>::Ptr& current_scan)
+{
+    GICP::Result result;
+    try
+    {
+        result = mGicp.align(*current_scan, mESKF.pose());
+    }
+    catch (const std::exception& exception)
+    {
+        RCLCPP_ERROR(get_logger(), "GICP failed: %s", exception.what());
         return false;
     }
+
     // mESKF.observe(Sophus::SE3d(result.transform.rotation(), result.transform.translation()));
     // RCLCPP_INFO_STREAM_THROTTLE(get_logger(), *get_clock(), 1000, "Measure Cov" << result.measure_covariance);
     // mESKF.observe(Sophus::SE3d(result.transform.rotation(), result.transform.translation()), result.measure_covariance);
@@ -177,6 +239,14 @@ void Localization_LIO::workerLoop()
                 RCLCPP_WARN(get_logger(), "First frame contains no finite intensity values; no threshold was selected.");
             }
 
+            const auto denoised_scan = denoiseAndDownsample(cloud);
+            if (denoised_scan->size() < 200)
+            {
+                RCLCPP_WARN(get_logger(), "denoised_scan has too few points!");
+                mInitialized = false;
+                continue;
+            }
+
             std::vector<lio::ImuData> imu_datas;
             {
                 std::lock_guard<std::mutex> lock(mImuBufferMutex);
@@ -190,20 +260,10 @@ void Localization_LIO::workerLoop()
             }
             // mESKF.setTimestamp(stamped_cloud.end_time);
 
-            try
-            {
-                mGicp.prepareSource(stamped_cloud, preprocessing());
-                if (!mGicp.initializePreparedTarget(mESKF.pose(), 200))
-                {
-                    RCLCPP_WARN(get_logger(), "GPU preprocessing retained too few points to initialize the map.");
-                    mInitialized = false;
-                }
-            }
-            catch (const std::exception& exception)
-            {
-                RCLCPP_ERROR(get_logger(), "CUDA map initialization failed: %s", exception.what());
-                mInitialized = false;
-            }
+            mMap = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+            pcl::transformPointCloud(*denoised_scan, *mMap, mESKF.pose().cast<float>());
+            // mGicp.initializeTarget(*mMap);
+            mGicp.insertTargetPoints(*mMap);
             continue;
         }
 
@@ -232,7 +292,7 @@ void Localization_LIO::workerLoop()
             }
             try
             {
-                mImuProcessor->prepareTrajectory(imu_datas, stamped_cloud, last_state);
+                mImuProcessor->process(imu_datas, stamped_cloud, last_state);
             }
             catch (const std::exception& e)
             {
@@ -243,63 +303,30 @@ void Localization_LIO::workerLoop()
             break;
         }
 
-        const auto trajectory = mImuProcessor->trajectory();
-        try
-        {
-            mGicp.prepareSource(stamped_cloud, preprocessing(), trajectory,
-                               Eigen::Isometry3d(mImuProcessor->extrinsic().matrix()));
-        }
-        catch (const std::exception& exception)
-        {
-            RCLCPP_ERROR(get_logger(), "CUDA scan preparation failed: %s", exception.what());
-            eskf_predict_future.get();
-            continue;
-        }
+        // const auto scan_in_imu = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+        const auto denoised_cloud = denoiseAndDownsample(stamped_cloud);
 
         /* GICP and observe */
         eskf_predict_future.get();
-        try
+        if (alignScanToMap(denoised_cloud))
         {
-            if (alignScanToMap()) updateVoxelMap();
+            updateVoxelMap(*denoised_cloud);
         }
-        catch (const std::exception& exception)
-        {
-            RCLCPP_ERROR(get_logger(), "Registration/map update failed: %s", exception.what());
-            continue;
-        }
-        const bool publish_scan = mProcessedScanVisPub->get_subscription_count() != 0 ||
-                                  mProcessedScanVisPub->get_intra_process_subscription_count() != 0;
-        const bool publish_map = mVoxelMapPub->get_subscription_count() != 0 ||
-                                 mVoxelMapPub->get_intra_process_subscription_count() != 0;
-        if (publish_scan || publish_map)
-        {
-            GICP::FrameResult visualization;
-            try
-            {
-                visualization = mGicp.downloadPrepared(mESKF.pose(), publish_scan, publish_map);
-            }
-            catch (const std::exception& exception)
-            {
-                RCLCPP_ERROR(get_logger(), "CUDA visualization download failed: %s", exception.what());
-                continue;
-            }
-            if (publish_scan)
-            {
-                sensor_msgs::msg::PointCloud2 scan_vis_msg;
-                pcl::toROSMsg(visualization.scan_in_map, scan_vis_msg);
-                scan_vis_msg.header.stamp = this->now();
-                scan_vis_msg.header.frame_id = "map";
-                mProcessedScanVisPub->publish(scan_vis_msg);
-            }
-            if (publish_map)
-            {
-                sensor_msgs::msg::PointCloud2 map_msg;
-                pcl::toROSMsg(visualization.map, map_msg);
-                map_msg.header.stamp = this->now();
-                map_msg.header.frame_id = "map";
-                mVoxelMapPub->publish(map_msg);
-            }
-        }
+
+        pcl::PointCloud<pcl::PointXYZ> transformed_scan;
+        pcl::transformPointCloud(*denoised_cloud, transformed_scan, mESKF.pose().cast<float>());
+
+        sensor_msgs::msg::PointCloud2 scan_vis_msg;
+        pcl::toROSMsg(transformed_scan, scan_vis_msg);
+        scan_vis_msg.header.stamp = this->now();
+        scan_vis_msg.header.frame_id = "map";
+        mProcessedScanVisPub->publish(scan_vis_msg);
+
+        sensor_msgs::msg::PointCloud2 map_msg;
+        pcl::toROSMsg(*mMap, map_msg);
+        map_msg.header.stamp = this->now();
+        map_msg.header.frame_id = "map";
+        mVoxelMapPub->publish(map_msg);
 
         geometry_msgs::msg::PoseStamped pose_msg;
         pose_msg.header.stamp = rclcpp::Time(static_cast<int64_t>(stamped_cloud.end_time * 1e9));

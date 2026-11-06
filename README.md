@@ -4,26 +4,91 @@
 
 `SparseVoxel` uses a CUDA/cuCollections backend inspired by FAR-LIO's
 [cuVoxelMap](https://github.com/TUMFTM/FAR-LIO/blob/main/lib_cpp/odometry_cpp/modules/map_handler/include/map_handler/voxel_hash_map.cuh).
-The numerical hot path stays on one CUDA stream:
-
-- Intensity/footprint filtering, centroid voxel downsampling, and sensor transforms.
-- Per-point motion compensation using the CPU-propagated IMU trajectory.
-- Sparse map insertion, incremental covariances, and local 1-NN/kNN searches.
-- GICP transforms, residuals, Jacobians, packed Hessian/gradient reduction,
-  pivoted LDLT solves, SE(3) updates, and convergence/acceptance decisions.
-- Registration-map updates and the separate centroid map used for visualization.
-
-The CPU handles ROS decoding/publishing, first-frame intensity statistics, IMU
-trajectory propagation, and ESKF state fusion. Point arrays, source/target maps,
-and intermediate normal equations are not downloaded during registration.
-The host queues a fixed iteration budget; device flags stop numerical work after
-convergence without polling or synchronizing each iteration.
+The current compact implementation runs sparse insertion, covariances, local
+1-NN/kNN, GICP point transforms, residuals, Jacobians and normal-equation reduction
+on CUDA. The CPU solves the reduced 6x6 system, updates the pose and controls
+convergence. Point arrays and correspondence arrays are not downloaded.
 
 Implementation: [GICP.cu](source/GICP/GICP.cu),
 [SparseVoxel.cu](source/types/SparseVoxel.cu), and
-[SparseVoxelDevice.cuh](include/localization/types/SparseVoxelDevice.cuh).
+[SparseVoxel.cuh](include/localization/types/SparseVoxel.cuh).
 
-### Input/output boundaries
+### SparseVoxel device API
+
+`SparseVoxel` exposes its device methods directly, without a separate device view.
+Allocate it with `new` or `std::make_unique<SparseVoxel>()`: its allocation operator
+places the object in CUDA unified memory. Do not use a stack object or
+`std::make_shared` for GPU access.
+
+```cpp
+__global__ void query(const SparseVoxel* map, SparseVoxel::Neighbor* result)
+{
+    if (threadIdx.x == 0 && blockIdx.x == 0)
+        *result = map->nearestNeighbor(Eigen::Vector3f::Zero(), 1.0f);
+}
+
+// Host:
+auto map = std::make_unique<SparseVoxel>();
+bool added = map->insert(cloud);
+query<<<1, 1>>>(map.get(), device_result);
+```
+
+Only construction, destruction and `insert()` run on the host. `insert()` uploads
+the cloud, then groups voxels, filters points and updates affected covariances on
+the GPU. It blocks until completion and returns whether any point was added.
+Input coordinates must be finite and in `[-16384, 16384)` m; an invalid batch is
+rejected before the map changes. Hash occupancy is limited to half of its
+`2^23`-slot budget.
+
+`empty()`, `points()`, `nearestNeighbor()` and `nearestNeighbors()` are device-only.
+`points()` returns a non-owning device span. `nearestNeighbors(query, k, output)`
+writes up to `k` neighbors, sorted by squared distance, and returns their count;
+provide space for `k` results (`k == 0` permits a null output). Queries must be
+finite and within the coordinate range; `k` must be nonnegative and the 1-NN
+distance limit must be positive. Both searches are local to 27 voxels, with
+lexicographic voxel/insertion ordering for ties and a strict 1-NN distance limit.
+
+Point addresses survive subsequent insertions; the span's pointer array may be
+reallocated, so acquire a new span after insertion. Copies and moves are disabled.
+Readers must finish before insertion; destruction waits for pending GPU work.
+This API is also used by the compact GICP alignment implementation below.
+
+### GICP CUDA alignment
+
+`GICP::insertTargetPoints()` maintains a device-resident target map.
+`GICP::align()` builds a device source map, then uses a fused CUDA
+`transform_reduce` for point transformation, local correspondence search,
+covariance weighting and double-precision normal equations. Only a 240-byte
+aggregate is returned per iteration; Eigen's CPU LDLT and Sophus perform the
+small solve and left pose update. There is no separate correspondence buffer or
+CPU nearest-neighbor search.
+
+The original covariance fallback, strict distance gate and iteration semantics
+are preserved. `converged` retains the legacy meaning of at least one finite
+completed iteration, including reaching the iteration limit. Quality thresholds
+`min_correspondences` and `max_fitness_score` remain caller-side acceptance gates.
+Copies are disabled; moves preserve ownership of the managed target map.
+
+On an RTX 5080 / CUDA 13, a seeded rigid-transform benchmark compared this design
+with a cooperative all-GPU loop. Both paths took three iterations; timings are
+median wall-clock milliseconds over seven warmed calls, including source-map
+construction, covariance estimation and result download:
+
+| Input points | Cooperative GPU loop | Final hybrid implementation |
+|---|---:|---:|
+| 600 | 2.28 ms | 2.54 ms |
+| 6,000 | 3.28 ms | 3.02 ms |
+| 30,000 | 3.85 ms | 3.46 ms |
+
+These are synthetic-workload measurements, not guarantees for every scan.
+The simpler hybrid implementation was retained for its lower latency on the
+larger scans; the cooperative loop was faster on the smallest input.
+
+### Historical ROS input/output boundaries
+
+The prepared-frame and preprocessing APIs in this section describe an earlier
+implementation; they are not exposed by the current compact `GICP` interface.
+The ROS node integration has not been restored or validated by these changes.
 
 The default LO node uses `GICP::processFrame`: one raw-scan upload followed by GPU
 preprocessing, registration, and conditional map updates, with one endpoint
@@ -54,19 +119,13 @@ snapshots can still cost time; not all synchronization can be removed.
   This is not PCL's fixed-spectrum covariance model.
 - Covariances use float; GICP linearization, reduction, LDLT, and pose updates
   use double. No new damping or robust loss is introduced.
-- Voxel keys pack three signed 21-bit coordinates into 63 bits. With the default
-  voxel size, positions must be in `[-524288, 524288)` m on every axis. Nonfinite
+- Voxel keys store three signed 16-bit coordinates. With the default
+  voxel size, positions must be in `[-16384, 16384)` m on every axis. Nonfinite
   and out-of-range positions throw instead of aliasing another voxel.
-- Scalar queries remain available; use `nearestNeighborBatch` and
-  `nearestNeighborsBatch` for compatibility queries. Each batch preserves query order.
-  These host-facing APIs explicitly download results; the registration path uses
-  device views instead. Host point snapshots are lazy. Once pointers have been
-  exposed, standalone insertion refreshes the snapshot to preserve their values.
-  Returned host point pointers remain valid across insertions, but not after
-  clearing, assignment, or destruction of their owning map.
-- Map copies are independent; moves and clear/reinsert are supported. Concurrent
-  read-only queries are serialized on the map's CUDA stream. Insertion/clearing
-  must not overlap readers. CUDA failures throw; there is no silent CPU fallback.
+- Queries run directly inside caller kernels; there are no host query wrappers or
+  host point snapshots. Returned point pointers address device memory and remain
+  valid until map destruction. Concurrent read-only kernels are supported, but
+  insertion must not overlap readers. CUDA failures throw; there is no CPU fallback.
 - GPU preprocessing reports dropped nonfinite input points. Legacy XYZ map
   insertion/query APIs reject nonfinite input instead of filtering it.
 - The visualization map preserves the initial processed scan and subsequently
@@ -84,29 +143,32 @@ for an offline build, pass
 ```bash
 source /opt/ros/jazzy/setup.bash
 cmake -S . -B build -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j2
-ctest --test-dir build --output-on-failure -R '^gpu_resident_regression$'
+cmake --build build --target sparse_voxel_gpu_test gicp_cuda_test -j2
+ctest --test-dir build --output-on-failure -R '^(sparse_voxel_gpu_test|gicp_cuda_test)$'
 ```
 
 The default CUDA architecture is `native`. For cross-compilation, set
 `-DCMAKE_CUDA_ARCHITECTURES=<compute capability without a dot>`, e.g. `120`.
-The focused regression compares search with local brute force, covariances with
-the CPU formula, and GPU registration with an independent CPU Eigen/Sophus solver.
-It also checks capacity/spacing, copies and point lifetimes, concurrent queries,
-rank deficiency, zero iterations, invalid input, centroid-map updates, and deskew
-including trajectories extending beyond the scan end.
+The focused regression compares device searches with local brute force and
+covariances with the CPU formula. It also checks capacity/spacing, point lifetimes,
+incremental covariance updates, empty maps, key boundaries, invalid input and
+neighbor counts larger than the covariance neighborhood.
+GICP tests compare against a CPU Eigen/Sophus implementation and a known rigid
+transform, including empty targets, zero/limited iterations, no correspondences,
+invalid input, covariance fallbacks, singular systems and move ownership.
 
 Optional checks:
 
 ```bash
-compute-sanitizer --tool memcheck --track-stream-ordered-races all --leak-check full --error-exitcode 1 build/gpu_resident_regression
-compute-sanitizer --tool initcheck --error-exitcode 1 build/gpu_resident_regression
-compute-sanitizer --tool synccheck --error-exitcode 1 build/gpu_resident_regression
-nsys profile --trace=cuda --sample=none --cpuctxsw=none --capture-range=cudaProfilerApi --capture-range-end=stop -o gpu-align build/gpu_resident_regression --profile
-nsys profile --trace=cuda --sample=none --cpuctxsw=none --capture-range=cudaProfilerApi --capture-range-end=stop -o gpu-frame build/gpu_resident_regression --profile-frame
+compute-sanitizer --tool memcheck --leak-check full --error-exitcode 1 build/sparse_voxel_gpu_test
+compute-sanitizer --tool initcheck --error-exitcode 1 build/sparse_voxel_gpu_test
+compute-sanitizer --tool synccheck --error-exitcode 1 build/sparse_voxel_gpu_test
+compute-sanitizer --tool memcheck --leak-check full --error-exitcode 1 build/gicp_cuda_test
+compute-sanitizer --tool initcheck --error-exitcode 1 build/gicp_cuda_test
+compute-sanitizer --tool synccheck --error-exitcode 1 build/gicp_cuda_test
 ```
 
-### Measured synchronization reduction
+### Historical synchronization measurements
 
 On an RTX 5080 / CUDA 13, the same seeded 6,000-point alignment (four successful
 iterations, 40-iteration budget, no visualization) was measured before and after:

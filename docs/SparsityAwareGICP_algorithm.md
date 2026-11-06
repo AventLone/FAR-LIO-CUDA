@@ -1,15 +1,22 @@
 # SparsityAwareGICP Algorithm Flow
 
-当前 `GICP` 的预处理、逐点去畸变、地图插入、协方差、对应搜索、法方程归约、LDLT 求解、SE(3) 更新与收敛判定均在 GPU。CPU 只保留 ROS 输入输出、首帧强度统计、IMU 轨迹传播和 ESKF 融合。构建、同步边界及实测结果见 [README](../README.md)。
+当前精简版 `GICP` 在 GPU 完成地图插入、协方差、逐点变换、对应搜索、加权残差与法方程归约；
+CPU 每轮只接收 240 字节归约结果，用 Eigen LDLT 求解 6x6 系统，并执行 Sophus 左乘更新与迭代控制。
+实测该混合方案比协作式全 GPU 迭代更快，因此不保留额外的设备求解器。构建及实测结果见 [README](../README.md#gicp-cuda-alignment)。
 
 第 1、3、4、13–15 节保留旧 `SparsityAwareGICP` 的布局和实验历史，不代表当前设备端布局、配置或可执行目标。历史 Cauchy/阻尼推导属于可选拓展；当前实现取 $w=1$、$\lambda=0$。
 
+`SparseVoxel` 现已改为直接提供设备成员函数；对象以 `new` / `std::make_unique` 分配到统一内存，
+CPU 只负责资源管理和阻塞式 `insert()`。设备接口和生命周期约束见 [README](../README.md#sparsevoxel-device-api)。
+当前 `insertTargetPoints()` / `align()` 已对照 CPU Eigen/Sophus 实现验证；
+下述预处理、去畸变、常驻帧与可视化完整流程属于旧实现说明，不代表当前精简接口。
+
 实现位于以下文件：
 
-- [`GICP.h`](../include/localization/GICP/GICP.h)：配置、结果与常驻帧接口。
-- [`GICP.cu`](../source/GICP/GICP.cu)：预处理、去畸变、完整设备端配准和可视化地图。
-- [`SparseVoxelDevice.cuh`](../include/localization/types/SparseVoxelDevice.cuh)：设备视图、异步缓冲和近邻搜索。
-- [`SparseVoxel.cu`](../source/types/SparseVoxel.cu)：异步插入、增量协方差和显式主机兼容接口。
+- [`GICP.h`](../include/localization/GICP/GICP.h)：配置、结果、目标插入与配准接口。
+- [`GICP.cu`](../source/GICP/GICP.cu)：CUDA 对应搜索与归约、CPU 小矩阵求解和位姿更新。
+- [`SparseVoxel.cuh`](../include/localization/types/SparseVoxel.cuh)：统一的主机插入与设备查询接口，无独立设备视图。
+- [`SparseVoxel.cu`](../source/types/SparseVoxel.cu)：GPU 分组插入、增量协方差和近邻搜索。
 
 ## 1 数据对象
 
@@ -184,11 +191,9 @@ add new voxel keys to voxel_map and occupied_voxels
 当前 `GICP` 使用 [`SparseVoxel.cu`](../source/types/SparseVoxel.cu) 中的 CUDA 内核并行估计协方差。
 初次插入和增量插入都使用同一策略；增量插入会重新估计受影响体素及相邻体素中的点。
 GPU 按 key 稳定分组，每个体素由一个线程按原输入顺序筛点，不使用竞争式自旋锁。
-设备哈希表保存体素下标而不是设备指针，扩容重建哈希表不会留下悬空指针。
-受影响标记去重后，每个有效点由一个线程独立选取最近邻并更新协方差。
-GPU 上的计数、前缀和与点下标列表直接供后续内核使用，不为插入结果回传体素或点数组。
-主机镜像仅在显式主机查询时创建；一旦对外暴露点指针，独立 `SparseVoxel::insert()` 会刷新该兼容镜像。
-配准私有地图不暴露主机指针，因此不触发该同步路径。
+设备哈希表保存独立分批分配的体素指针，后续插入不会移动已有点。
+发生变化的体素原子标记其相邻体素，每个受影响点由一个线程独立选取最近邻并更新协方差。
+主机等待插入完成并返回是否新增点，不回传体素或点数组，也不维护主机镜像。
 
 ### 5.1 邻域搜索
 
@@ -198,12 +203,10 @@ $$
 dx, dy, dz \in [-1, 1]
 $$
 
-候选包含当前点本身，通过最大堆保留局部最近的最多 12 个点。
+候选包含当前点本身，通过定长有序数组保留局部最近的最多 12 个点。
 这仍是固定体素窗口内的局部 kNN，不是全局 kNN。
 邻居不足 8 个时，保持 `covariance = I` 和 `covariance_valid = false`，沿用原有回退行为。
-候选体素按当前体素、面邻居、边邻居、角邻居的顺序访问。
-堆填满后，使用当前最远邻居距离作为搜索半径；若查询点到某候选体素包围盒的距离下界
-已经超过该半径，则跳过整个体素的点扫描。浮点比较留有保守裕量，避免边界误剪枝。
+候选体素按坐标字典序访问，体素内按插入顺序访问；等距时保留先访问的点。
 
 ### 5.2 保留现有 Frobenius 协方差归一化
 
@@ -226,8 +229,8 @@ C = \Sigma_{\mathrm{raw}} + 10^{-6}I,\qquad
 \Sigma_{\mathrm{GICP}} = C\,\|C^{-1}\|_F
 $$
 
-有效结果设 `covariance_valid = true`；邻居不足时保留无效单位阵。
-非有限或不可用的归一化结果会通过异常显式报告，不会伪装成有效协方差。
+完成归一化后设 `covariance_valid = true`；邻居不足时保留无效单位阵。
+非有限或超出体素坐标范围的输入在插入前通过异常显式拒绝。
 
 此矩阵是 GICP 的几何权重模型，不应作为物理测量噪声协方差。
 源点和目标点都使用相同归一化；当前使用最少 8、最多 12 个邻居及 0.5 m 体素，存储和运算使用 `float`。
